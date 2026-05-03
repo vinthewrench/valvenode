@@ -1,0 +1,17 @@
+
+ValveNode License
+
+Copyright (c) 2026 Vincent Moscaritolo
+
+This repository contains both software/firmware and hardware design files.
+
+Software and firmware are licensed under the MIT License.
+
+Hardware design files are licensed under the CERN Open Hardware Licence Version 2 - Permissive.
+
+See:
+
+- LICENSE-MIT
+
+- LICENSE-CERN-OHL-P-2.0
+
