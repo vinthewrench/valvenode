@@ -1,0 +1,239 @@
+# ============================================================
+# macOS filesystem junk
+# ============================================================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon
+
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+*.icloud
+
+
+# ============================================================
+# Editor and IDE local files
+# ============================================================
+
+.vscode/
+.idea/
+.zed/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+
+# ============================================================
+# Build directories
+# ============================================================
+
+build/
+_build/
+cmake-build-*/
+Debug/
+Release/
+out/
+bin/
+obj/
+
+
+# ============================================================
+# CMake generated files
+# ============================================================
+
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+
+# ============================================================
+# C / C++ build artifacts
+# ============================================================
+
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.lss
+*.sym
+*.d
+*.gcno
+*.gcda
+*.gcov
+
+
+# ============================================================
+# AVR / embedded toolchain outputs
+# ============================================================
+
+*.eep
+*.srec
+*.fuses
+*.lock
+*.su
+
+
+# ============================================================
+# Doxygen generated output
+# ============================================================
+
+docs/
+html/
+latex/
+doxygen.log
+
+
+# ============================================================
+# KiCad generated noise
+#
+# Keep source design files:
+#   *.kicad_pro
+#   *.kicad_sch
+#   *.kicad_pcb
+#   *.kicad_sym
+#   *.kicad_mod
+#   fp-lib-table
+#   sym-lib-table
+# ============================================================
+
+*-backups/
+*.kicad_prl
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*.kicad_sym-bak
+*.kicad_mod-bak
+*.bak
+*.bck
+*.sch-bak
+*.pcb-bak
+
+# Autosave / rescue leftovers
+_autosave-*
+*-rescue.kicad_sch
+*-rescue.lib
+*-rescue.dcm
+
+# Local 3D cache
+3d_cache/
+.kicad_plugins/
+
+# KiCad local footprint library cache
+fp-info-cache
+fp-info-cache.*
+
+# Zipped build output snapshots
+build.zip
+build-*.zip
+*-build.zip
+build_*.zip
+
+# ============================================================
+# KiCad fabrication / generated outputs
+#
+# These are usually regenerated from the board source.
+# Remove these ignores if you intentionally archive fab packages in git.
+# ============================================================
+
+gerbers/
+Gerbers/
+fab/
+fabrication/
+jlcpcb/
+oshpark/
+plots/
+plot/
+drill/
+drills/
+bom/
+BOM/
+*.gbr
+*.gbrjob
+*.drl
+*.pos
+*.rpt
+*.step
+*.stp
+*.wrl
+
+
+# KiCad local history/cache
+#
+.history/
+
+# ============================================================
+# Local project folders
+# ============================================================
+
+parts/
+
+
+# ============================================================
+# Runtime logs and local databases
+# ============================================================
+
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+assets/logfile.txt
+assets/piotserver.db
+
+
+# ============================================================
+# Local environment / secrets
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+
+# ============================================================
+# Xcode local state
+# ============================================================
+
+xcuserdata/
+XCBuildData/
+*.xcscmblueprint
+*.xccheckout
+
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+
+**/xcshareddata/WorkspaceSettings.xcsettings

@@ -1,0 +1,195 @@
+Valve Node Example Commands (Dual Valve Node)
+=============================================
+
+Assumptions
+-----------
+- Example assigned node address = 04
+- Unassigned node address = 00
+- Broadcast address = FF
+- Request format: :DDC[A][KK]
+- Reply format:   :DDC[A][B]KK
+- Requests may omit checksum
+- Replies always include checksum
+- Line ending may be CR, LF, or CRLF
+
+Where
+-----
+- DD = 2 hex digit node address
+- C  = 1 character command
+- A  = optional 1 character argument
+- B  = optional 1 character second reply argument
+- KK = 2 hex digit ASCII-sum checksum of the body bytes
+
+Paste these into your terminal.
+
+Basic directed commands
+-----------------------
+PING node 04
+:04P
+
+STATUS valve 1
+:04S1
+
+STATUS valve 2
+:04S2
+
+OPEN valve 1
+:04O1
+
+OPEN valve 2
+:04O2
+
+CLOSE valve 1
+:04C1
+
+CLOSE valve 2
+:04C2
+
+Get firmware version
+:04V
+
+Put node 04 into identify mode
+:04I
+
+Put node 04 into config mode
+:04M
+
+Unassigned node into config mode
+:00M
+
+Assign node address 04 while in config mode
+:04N
+
+Broadcast commands
+------------------
+WHO broadcast
+:FFW
+
+Cancel config / identify mode on all nodes
+:FFX
+
+Expected replies
+----------------
+PING reply from node 04
+:04AA5
+
+STATUS reply, valve 1 OPEN
+:04R1O42
+
+STATUS reply, valve 1 CLOSED
+:04R1C36
+
+STATUS reply, valve 2 OPEN
+:04R2O43
+
+STATUS reply, valve 2 CLOSED
+:04R2C37
+
+WHO reply from node 04
+:04WBB
+
+Firmware version reply, version 1.00
+:04V01004B
+
+Boot banner from node 04
+:04BA6
+
+ACK from newly assigned node 04
+:04AA5
+
+Checksum examples
+-----------------
+The checksum is the 8-bit sum of the ASCII body bytes.
+
+Example:
+Body 04P
+- '0' = 0x30
+- '4' = 0x34
+- 'P' = 0x50
+Sum = 0xB4
+
+So:
+:04PB4
+
+Useful commands with real checksums
+-----------------------------------
+PING node 04
+:04PB4
+
+STATUS valve 1
+:04S1B5
+
+STATUS valve 2
+:04S2B6
+
+OPEN valve 1
+:04O1B1
+
+OPEN valve 2
+:04O2B2
+
+CLOSE valve 1
+:04C1A5
+
+CLOSE valve 2
+:04C2A6
+
+Get firmware version
+:04VB6
+
+Identify node 04
+:04IB0
+
+Enter config mode on node 04
+:04MB4
+
+Enter config mode on unassigned node
+:00M9D
+
+Assign address 04
+:04NB5
+
+WHO broadcast
+:FFW1C
+
+Cancel config / identify mode
+:FFX1D
+
+Suggested bench test order
+--------------------------
+Assigned node bring-up
+:04P
+:04V
+:04S1
+:04O1
+:04S1
+:04C1
+:04S1
+:04O2
+:04S2
+:04C2
+:04S2
+:04I
+:FFX
+:FFW
+
+Unassigned node enrollment
+:00M
+:04N
+:04P
+:04V
+:FFW
+
+Protocol notes
+--------------
+- Unassigned node 00 does not answer normal directed commands such as :00P or :00S1
+- Unassigned node 00 may accept :00M to enter config mode
+- :DDN assigns the new address DD only while already in config mode
+- :FFW is a staggered broadcast reply. Assigned nodes answer in address-based time slots
+- :FFX silently cancels config mode and identify mode
+- Identify mode does not stop normal command handling
+- Config mode times out automatically if not completed
+
+Terminal note
+-------------
+The parser accepts CR, LF, or CRLF. A normal serial terminal is fine.
