@@ -108,7 +108,7 @@ build.ninja
 # Doxygen generated output
 # ============================================================
 
-docs/
+**/test/docs/
 html/
 latex/
 doxygen.log

@@ -1,0 +1,79 @@
+Valve Node Example Commands
+===========================
+
+Assumptions:
+- Node address = 1
+- Checksum checking is currently ignored
+- Frame format: @|LEN|COMMAND|ADDR|CHECKSUM<CR>
+
+Paste these into your terminal.
+
+Basic commands
+--------------
+
+PING
+@|6|PING|1|00
+
+STATUS
+@|8|STATUS|1|00
+
+OPEN
+@|6|OPEN|1|00
+
+CLOSE
+@|7|CLOSE|1|00
+
+WHO broadcast
+@|7|WHO|255|00
+
+
+Expected replies
+----------------
+
+PING reply
+@|5|ACK|1|xx
+
+STATUS reply when CLOSED
+@|14|STATE|1|CLOSED|xx
+
+STATUS reply when OPEN
+@|12|STATE|1|OPEN|xx
+
+WHO reply
+@|4|ID|1|xx
+
+
+Commands with real checksums
+----------------------------
+
+PING
+@|6|PING|1|D2
+
+STATUS
+@|8|STATUS|1|57
+
+OPEN
+@|6|OPEN|1|E0
+
+CLOSE
+@|7|CLOSE|1|4F
+
+WHO broadcast
+@|7|WHO|255|0D
+
+
+Suggested bench test order
+--------------------------
+
+@|8|STATUS|1|00
+@|6|OPEN|1|00
+@|8|STATUS|1|00
+@|7|CLOSE|1|00
+@|8|STATUS|1|00
+@|7|WHO|255|00
+
+
+Terminal note
+-------------
+
+If your terminal sends LF instead of CR, the parser may ignore the line.
