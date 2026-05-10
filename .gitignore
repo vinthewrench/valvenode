@@ -237,3 +237,6 @@ XCBuildData/
 !*.xcworkspace/contents.xcworkspacedata
 
 **/xcshareddata/WorkspaceSettings.xcsettings
+
+# Build outputs
+valvenode-slave/test/vnode
