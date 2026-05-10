@@ -6,10 +6,16 @@
  * Talks to the ATmega88PB Valve Master over I2C.
  *
  * Current target:
- *   sim/valvenode_master_sim.c on I2C address 0x09
- *
- * Later target:
  *   firmware/valvenode_master.c on the real valve-master PCB.
+ *
+ * Notes:
+ *   Field power is host-controlled. Commands that talk to valve nodes
+ *   require field power to be turned on first:
+ *
+ *     ./valve power on
+ *     ./valve ping 1
+ *     ./valve closeall
+ *     ./valve power off
  */
 
 #include <cstdio>
@@ -45,6 +51,7 @@ static void usage(const char* prog)
         "  %s [options] map\n"
         "  %s [options] ping <node 1-254>\n"
         "  %s [options] set <node 1-254> <channel 1-16> <on|off>\n"
+        "  %s [options] closeall\n"
         "  %s [options] channel <node 1-254> <channel 1-16> status\n"
         "  %s [options] version master\n"
         "  %s [options] version <node 1-254>\n"
@@ -60,14 +67,21 @@ static void usage(const char* prog)
         "  %s [options] fault set\n"
         "  %s [options] fault clear\n"
         "\n"
+        "common flow:\n"
+        "  %s power on\n"
+        "  %s ping 1\n"
+        "  %s closeall\n"
+        "  %s power off\n"
+        "\n"
         "options:\n"
         "  -a, --addr <addr>  I2C address, default 0x09. Accepts decimal or hex.\n"
         "  -v, --verbose      enable verbose output\n"
         "  -d, --debug        enable debug output\n",
-        prog, prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog, prog, prog, prog, prog, prog, prog,
         prog, prog, prog, prog,
         prog, prog, prog,
-        prog, prog
+        prog, prog,
+        prog, prog, prog, prog
     );
 }
 
@@ -158,7 +172,36 @@ static const char* result_name(uint8_t result)
     case Valve_master::RESULT_CONFIG_REQUIRED:     return "CONFIG_REQUIRED";
     case Valve_master::RESULT_ADDRESS_IN_USE:      return "ADDRESS_IN_USE";
     case Valve_master::RESULT_BUSY:                return "BUSY";
-    default:                                       return "UNKNOWN";
+
+#ifdef VALVE_MASTER_HAS_RESULT_RS485_TIMEOUT
+    case Valve_master::RESULT_RS485_TIMEOUT:       return "RS485_TIMEOUT";
+#endif
+
+#ifdef VALVE_MASTER_HAS_RESULT_RS485_BAD_CHECKSUM
+    case Valve_master::RESULT_RS485_BAD_CHECKSUM:  return "RS485_BAD_CHECKSUM";
+#endif
+
+#ifdef VALVE_MASTER_HAS_RESULT_RS485_BAD_REPLY
+    case Valve_master::RESULT_RS485_BAD_REPLY:     return "RS485_BAD_REPLY";
+#endif
+
+#ifdef VALVE_MASTER_HAS_RESULT_POWER_OFF
+    case Valve_master::RESULT_POWER_OFF:           return "POWER_OFF";
+#endif
+
+    default:
+        /*
+         * Keep local fallbacks here so this test tool still decodes newer
+         * firmware results even if Valve_master.hpp has not been updated yet.
+         */
+        switch (result) {
+        case 0x09: return "RS485_TIMEOUT";
+        case 0x0A: return "RS485_BAD_CHECKSUM";
+        case 0x0B: return "RS485_BAD_REPLY";
+        case 0x0C: return "RESERVED_0C";
+        case 0x0E: return "POWER_OFF";
+        default:   return "UNKNOWN";
+        }
     }
 }
 
@@ -242,6 +285,21 @@ static void print_map()
     }
 }
 
+static void print_failure_status(const char* what)
+{
+    uint8_t result = 0;
+
+    if (gDevice.getLastResult(result)) {
+        std::fprintf(stderr, "%s failed: 0x%02X %s\n", what, result, result_name(result));
+    } else {
+        std::fprintf(stderr, "%s failed\n", what);
+    }
+
+    if (gDebug_flag || gVerbose_flag) {
+        print_status();
+    }
+}
+
 int main(int argc, char* argv[])
 {
     signal(SIGINT, handler);
@@ -307,7 +365,7 @@ int main(int argc, char* argv[])
 
         if (std::strcmp(state, "on") == 0) {
             if (!gDevice.powerOn()) {
-                std::fprintf(stderr, "POWER_ON failed\n");
+                print_failure_status("POWER_ON");
                 exit_code = 1;
             } else {
                 print_status();
@@ -317,7 +375,7 @@ int main(int argc, char* argv[])
 
         if (std::strcmp(state, "off") == 0) {
             if (!gDevice.powerOff()) {
-                std::fprintf(stderr, "POWER_OFF failed\n");
+                print_failure_status("POWER_OFF");
                 exit_code = 1;
             } else {
                 print_status();
@@ -338,7 +396,7 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.whoScan()) {
-            std::fprintf(stderr, "WHO failed\n");
+            print_failure_status("WHO");
             exit_code = 1;
         } else {
             print_map();
@@ -373,7 +431,9 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.pingNode(node)) {
-            std::fprintf(stderr, "PING node %u failed\n", node);
+            char what[64];
+            std::snprintf(what, sizeof(what), "PING node %u", node);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             print_reply();
@@ -419,14 +479,33 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.setChannel(node, channel, on)) {
-            std::fprintf(stderr,
-                         "SET node %u channel %u %s failed\n",
-                         node,
-                         channel,
-                         on ? "on" : "off");
+            char what[96];
+            std::snprintf(what, sizeof(what),
+                          "SET node %u channel %u %s",
+                          node,
+                          channel,
+                          on ? "on" : "off");
+            print_failure_status(what);
             exit_code = 1;
         } else {
             print_reply();
+        }
+
+        goto done;
+    }
+
+    if (std::strcmp(cmd, "closeall") == 0) {
+        if ((argc - cmd_index) != 1) {
+            usage(argv[0]);
+            exit_code = 1;
+            goto done;
+        }
+
+        if (!gDevice.closeAll()) {
+            print_failure_status("CLOSE_ALL");
+            exit_code = 1;
+        } else {
+            print_status();
         }
 
         goto done;
@@ -456,7 +535,12 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.getChannelStatus(node, channel, state)) {
-            std::fprintf(stderr, "CHANNEL STATUS node %u channel %u failed\n", node, channel);
+            char what[96];
+            std::snprintf(what, sizeof(what),
+                          "CHANNEL STATUS node %u channel %u",
+                          node,
+                          channel);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             std::printf("node=%u channel=%u state=%s\n",
@@ -481,7 +565,7 @@ int main(int argc, char* argv[])
 
         if (std::strcmp(argv[cmd_index + 1], "master") == 0) {
             if (!gDevice.getMasterVersion(version)) {
-                std::fprintf(stderr, "MASTER VERSION failed\n");
+                print_failure_status("MASTER VERSION");
                 exit_code = 1;
             } else {
                 std::printf("master version: %02u.%02u (0x%04X)\n",
@@ -501,7 +585,9 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.getNodeVersion(node, version)) {
-            std::fprintf(stderr, "VERSION node %u failed\n", node);
+            char what[64];
+            std::snprintf(what, sizeof(what), "VERSION node %u", node);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             std::printf("node %u version: %02u.%02u (0x%04X)\n",
@@ -530,7 +616,9 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.identifyNode(node)) {
-            std::fprintf(stderr, "IDENTIFY node %u failed\n", node);
+            char what[64];
+            std::snprintf(what, sizeof(what), "IDENTIFY node %u", node);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             print_reply();
@@ -547,7 +635,7 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.cancel()) {
-            std::fprintf(stderr, "CANCEL failed\n");
+            print_failure_status("CANCEL");
             exit_code = 1;
         } else {
             print_reply();
@@ -574,7 +662,9 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.config(node)) {
-            std::fprintf(stderr, "CONFIG node %u failed\n", node);
+            char what[64];
+            std::snprintf(what, sizeof(what), "CONFIG node %u", node);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             print_reply();
@@ -598,7 +688,9 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.assign(node)) {
-            std::fprintf(stderr, "ASSIGN node %u failed\n", node);
+            char what[64];
+            std::snprintf(what, sizeof(what), "ASSIGN node %u", node);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             print_reply();
@@ -631,7 +723,9 @@ int main(int argc, char* argv[])
         }
 
         if (!gDevice.moveNode(old_node, new_node)) {
-            std::fprintf(stderr, "MOVE %u -> %u failed\n", old_node, new_node);
+            char what[64];
+            std::snprintf(what, sizeof(what), "MOVE %u -> %u", old_node, new_node);
+            print_failure_status(what);
             exit_code = 1;
         } else {
             std::printf("node moved: %u -> %u\n", old_node, new_node);
@@ -652,7 +746,7 @@ int main(int argc, char* argv[])
 
         if (std::strcmp(state, "set") == 0) {
             if (!gDevice.setError()) {
-                std::fprintf(stderr, "SET_ERROR command failed\n");
+                print_failure_status("SET_ERROR");
                 exit_code = 1;
             } else {
                 print_status();
@@ -663,7 +757,7 @@ int main(int argc, char* argv[])
 
         if (std::strcmp(state, "clear") == 0) {
             if (!gDevice.clearError()) {
-                std::fprintf(stderr, "CLEAR_ERROR command failed\n");
+                print_failure_status("CLEAR_ERROR");
                 exit_code = 1;
             } else {
                 print_status();

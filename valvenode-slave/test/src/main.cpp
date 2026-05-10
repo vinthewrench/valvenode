@@ -117,6 +117,7 @@ static void usage(const char *prog)
         "  %s [-d device] [-b baud] ping <node>\n"
         "  %s [-d device] [-b baud] open <node> <channel>\n"
         "  %s [-d device] [-b baud] close <node> <channel>\n"
+        "  %s [-d device] [-b baud] closeall\n"
         "  %s [-d device] [-b baud] status <node> <channel>\n"
         "  %s [-d device] [-b baud] version <node>\n"
         "  %s [-d device] [-b baud] identify <node>\n"
@@ -137,7 +138,7 @@ static void usage(const char *prog)
         "  %s -d /dev/cu.usbserial-XXXX config\n"
         "  %s -d /dev/cu.usbserial-XXXX assign 3\n"
         "  %s -d /dev/cu.usbserial-XXXX move 2 5\n",
-        prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog, prog, prog, prog, prog, prog,
         prog, prog, prog, prog,
         prog,
         prog, prog, prog, prog, prog);
@@ -956,6 +957,7 @@ int main(int argc, char **argv)
         }
 
         frame = make_request(node, 'P');
+
     } else if (std::strcmp(cmd, "open") == 0 || std::strcmp(cmd, "close") == 0) {
         if (argi + 2 != argc) {
             usage(argv[0]);
@@ -983,6 +985,29 @@ int main(int argc, char **argv)
         }
 
         frame = make_request(node, c, channel_char);
+
+    } else if (std::strcmp(cmd, "closeall") == 0) {
+        if (argi != argc) {
+            usage(argv[0]);
+            return 2;
+        }
+
+        /*
+         * Broadcast close-all.
+         *
+         * Frame:
+         *   :FFC\r
+         *
+         * Meaning:
+         *   FF = broadcast address
+         *   C  = close command with no channel argument
+         *
+         * No reply is expected. Nodes that support this command should close
+         * their local valve outputs and remain silent to avoid bus collisions.
+         */
+        frame = make_request(0xFF, 'C');
+        no_reply_expected = true;
+
     } else if (std::strcmp(cmd, "status") == 0) {
         if (argi + 2 != argc) {
             usage(argv[0]);
@@ -1009,6 +1034,7 @@ int main(int argc, char **argv)
         }
 
         frame = make_request(node, 'S', channel_char);
+
     } else if (std::strcmp(cmd, "version") == 0) {
         if (argi + 1 != argc) {
             usage(argv[0]);
@@ -1022,6 +1048,7 @@ int main(int argc, char **argv)
         }
 
         frame = make_request(node, 'V');
+
     } else if (std::strcmp(cmd, "identify") == 0) {
         if (argi + 1 != argc) {
             usage(argv[0]);
@@ -1035,6 +1062,7 @@ int main(int argc, char **argv)
         }
 
         frame = make_request(node, 'I');
+
     } else if (std::strcmp(cmd, "who") == 0) {
         if (argi != argc) {
             usage(argv[0]);
@@ -1044,6 +1072,7 @@ int main(int argc, char **argv)
         frame = make_request(0xFF, 'W');
         timeout_ms = WHO_TIMEOUT_MS;
         read_many = true;
+
     } else if (std::strcmp(cmd, "config") == 0) {
         uint8_t node = 0;
 
@@ -1065,6 +1094,7 @@ int main(int argc, char **argv)
         }
 
         frame = make_request(node, 'M');
+
     } else if (std::strcmp(cmd, "assign") == 0) {
         if (argi + 1 != argc) {
             usage(argv[0]);
@@ -1082,6 +1112,7 @@ int main(int argc, char **argv)
             new_node);
 
         frame = make_request(new_node, 'N');
+
     } else if (std::strcmp(cmd, "move") == 0) {
         if (argi + 2 != argc) {
             usage(argv[0]);
@@ -1104,6 +1135,7 @@ int main(int argc, char **argv)
         }
 
         move_command = true;
+
     } else if (std::strcmp(cmd, "cancel") == 0) {
         if (argi != argc) {
             usage(argv[0]);
@@ -1112,6 +1144,7 @@ int main(int argc, char **argv)
 
         frame = make_request(0xFF, 'X');
         no_reply_expected = true;
+
     } else if (std::strcmp(cmd, "raw") == 0) {
         if (argi + 1 != argc) {
             usage(argv[0]);
@@ -1119,6 +1152,7 @@ int main(int argc, char **argv)
         }
 
         frame = normalize_raw_frame(argv[argi]);
+
     } else {
         std::fprintf(stderr, "unknown command: %s\n", cmd);
         usage(argv[0]);

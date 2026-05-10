@@ -32,7 +32,7 @@
  *   PB3  MOSI
  *   PB4  MISO
  *   PB5  SCK
- *   PC0  FAULT input
+ *   PC0  FAULT_OUT, open-drain style: normal = high-Z, fault = driven low
  *   PC4  SDA
  *   PC5  SCL
  *   PD0  485RX
@@ -68,7 +68,7 @@
 #define MASTER_VERSION_HI           0x01u
 
 /** @brief Master firmware version low byte. */
-#define MASTER_VERSION_LO           0x00u
+#define MASTER_VERSION_LO           0x03u
 
 /** @brief Highest valid assigned valve-node address. */
 #define MAX_NODE_ADDR               254u
@@ -83,8 +83,14 @@
  * Product hardware pin map
  * ========================================================================== */
 
-/** @brief Fault input from board protection / upstream fault signal. */
-#define FAULT_PIN                   PC0
+/**
+ * @brief Fault output.
+ *
+ * Open-drain style:
+ *   normal / no fault = high-Z
+ *   fault             = driven low
+ */
+#define FAULT_OUT_PIN               PC0
 
 /** @brief RS-485 driver-enable pin. High = transmit, low = receive. */
 #define RS485_DE_PIN                PD2
@@ -95,10 +101,10 @@
 /** @brief Latching relay RESET coil driver output. */
 #define RELAY_RESET_PIN             PD4
 
-/** @brief Communications activity LED output. */
+/** @brief Communications activity LED output. Active-low. */
 #define COMM_LED_PIN                PD5
 
-/** @brief Fault LED output. */
+/** @brief Fault LED output. Active-low. */
 #define FAULT_LED_PIN               PD6
 
 /* ============================================================================
@@ -108,7 +114,7 @@
 /** @brief Relay coil pulse width in milliseconds. */
 #define RELAY_PULSE_MS              30u
 
-/** @brief Delay after enabling field power before issuing RS-485 commands. */
+/** @brief Delay after enabling field power so downstream nodes can wake. */
 #define BUS_POWER_UP_DELAY_MS       250u
 
 /** @brief UART baud rate for valve-node RS-485 bus. */
@@ -128,6 +134,9 @@
 
 /** @brief Grace delay after broadcast cancel before powering down. */
 #define RS485_CANCEL_GRACE_MS         20u
+
+/** @brief Grace delay after broadcast close-all before host may power down. */
+#define RS485_CLOSE_ALL_GRACE_MS      100u
 
 /** @brief Maximum received RS-485 line length including ':' and NUL. */
 #define RX_LINE_MAX                 24u
@@ -227,6 +236,9 @@
 /** @brief Deliberately set local error state for bench testing. */
 #define CMD_SET_ERROR               0x0Du
 
+/** @brief Broadcast close-all command to all valve nodes. */
+#define CMD_CLOSE_ALL               0x0Fu
+
 /* ============================================================================
  * Status and result values
  * ========================================================================== */
@@ -276,8 +288,11 @@
 /** @brief RS-485 reply was malformed or unexpected. */
 #define RESULT_RS485_BAD_REPLY      0x0Bu
 
-/** @brief Local fault input is active. */
-#define RESULT_FAULT_INPUT_ACTIVE   0x0Cu
+/** @brief Reserved legacy result slot. */
+#define RESULT_RESERVED_0C          0x0Cu
+
+/** @brief RS-485 command requested while field power is off. */
+#define RESULT_POWER_OFF            0x0Eu
 
 /* ============================================================================
  * Global state
@@ -305,28 +320,54 @@ static char g_rx_line[RX_LINE_MAX];
  * GPIO helpers
  * ========================================================================== */
 
-/** @brief Turn the communications LED on. */
+/** @brief Turn the communications LED on. LED is active-low. */
 static inline void comm_led_on(void)
-{
-    PORTD |= (1u << COMM_LED_PIN);
-}
-
-/** @brief Turn the communications LED off. */
-static inline void comm_led_off(void)
 {
     PORTD &= (uint8_t)~(1u << COMM_LED_PIN);
 }
 
-/** @brief Turn the fault LED on. */
+/** @brief Turn the communications LED off. LED is active-low. */
+static inline void comm_led_off(void)
+{
+    PORTD |= (1u << COMM_LED_PIN);
+}
+
+/** @brief Turn the fault LED on. LED is active-low. */
 static inline void fault_led_on(void)
+{
+    PORTD &= (uint8_t)~(1u << FAULT_LED_PIN);
+}
+
+/** @brief Turn the fault LED off. LED is active-low. */
+static inline void fault_led_off(void)
 {
     PORTD |= (1u << FAULT_LED_PIN);
 }
 
-/** @brief Turn the fault LED off. */
-static inline void fault_led_off(void)
+/** @brief Release fault output, high-Z / no fault. */
+static inline void fault_out_release(void)
 {
-    PORTD &= (uint8_t)~(1u << FAULT_LED_PIN);
+    PORTC &= (uint8_t)~(1u << FAULT_OUT_PIN);  /* no internal pull-up */
+    DDRC  &= (uint8_t)~(1u << FAULT_OUT_PIN);  /* input mode = high-Z */
+}
+
+/** @brief Assert fault output low. */
+static inline void fault_out_assert(void)
+{
+    PORTC &= (uint8_t)~(1u << FAULT_OUT_PIN);  /* output low */
+    DDRC  |= (1u << FAULT_OUT_PIN);            /* drive low */
+}
+
+/** @brief Update local red LED and external open-drain-style fault output. */
+static void update_fault_outputs(void)
+{
+    if (g_regs[REG_STATUS] & STATUS_ERROR) {
+        fault_led_on();
+        fault_out_assert();
+    } else {
+        fault_led_off();
+        fault_out_release();
+    }
 }
 
 /** @brief Set RS-485 transceiver to receive mode. */
@@ -341,31 +382,28 @@ static inline void rs485_set_tx(void)
     PORTD |= (1u << RS485_DE_PIN);
 }
 
-/**
- * @brief Read the local fault input.
- *
- * @return true if the fault input is active.
- */
-static inline bool fault_input_active(void)
-{
-    return (PINC & (1u << FAULT_PIN)) != 0u;
-}
-
-/** @brief Update the fault LED from STATUS_ERROR. */
-static void update_fault_led(void)
-{
-    if (g_regs[REG_STATUS] & STATUS_ERROR) {
-        fault_led_on();
-    } else {
-        fault_led_off();
-    }
-}
-
 /** @brief Initialize GPIO direction and safe idle states. */
 static void gpio_init(void)
 {
-    DDRC &= (uint8_t)~(1u << FAULT_PIN);
-    PORTC &= (uint8_t)~(1u << FAULT_PIN);
+    /*
+     * FAULT output is open-drain style:
+     *   normal = high-Z
+     *   fault  = driven low
+     */
+    fault_out_release();
+
+    /*
+     * Preload output latches before enabling outputs.
+     *
+     * Relay outputs idle low.
+     * RS-485 DE idle low = receive.
+     * LEDs are active-low, so idle high = off.
+     */
+    PORTD &= (uint8_t)~(1u << RS485_DE_PIN);
+    PORTD &= (uint8_t)~(1u << RELAY_SET_PIN);
+    PORTD &= (uint8_t)~(1u << RELAY_RESET_PIN);
+    PORTD |= (1u << COMM_LED_PIN);
+    PORTD |= (1u << FAULT_LED_PIN);
 
     DDRD |= (1u << RS485_DE_PIN) |
             (1u << RELAY_SET_PIN) |
@@ -374,10 +412,6 @@ static void gpio_init(void)
             (1u << FAULT_LED_PIN);
 
     rs485_set_rx();
-
-    PORTD &= (uint8_t)~(1u << RELAY_SET_PIN);
-    PORTD &= (uint8_t)~(1u << RELAY_RESET_PIN);
-
     comm_led_off();
     fault_led_off();
 }
@@ -401,7 +435,33 @@ static void set_result(uint8_t result)
         g_regs[REG_STATUS] |= STATUS_ERROR;
     }
 
-    update_fault_led();
+    update_fault_outputs();
+}
+
+/**
+ * @brief Check whether switched field power is believed to be on.
+ *
+ * @return true if field power is on.
+ */
+static bool field_power_is_on(void)
+{
+    return (g_regs[REG_STATUS] & STATUS_POWER_ON) != 0u;
+}
+
+/**
+ * @brief Require field power before sending RS-485 commands.
+ *
+ * @retval true Field power is on.
+ * @retval false Field power is off and RESULT_POWER_OFF was set.
+ */
+static bool require_field_power(void)
+{
+    if (!field_power_is_on()) {
+        set_result(RESULT_POWER_OFF);
+        return false;
+    }
+
+    return true;
 }
 
 /** @brief Clear last reply registers. */
@@ -985,6 +1045,14 @@ static void cmd_power_on(void)
 /** @brief Execute CMD_POWER_OFF. */
 static void cmd_power_off(void)
 {
+    /*
+     * The host owns power policy, but the master still gives the bus a short
+     * grace period before cutting field power.
+     */
+    for (uint8_t i = 0u; i < RS485_CANCEL_GRACE_MS; i++) {
+        _delay_ms(1);
+    }
+
     bus_power_off();
     set_result(RESULT_OK);
 }
@@ -995,9 +1063,11 @@ static void cmd_who(void)
     char frame[8];
     uint8_t count = 0u;
 
-    clear_node_map();
+    if (!require_field_power()) {
+        return;
+    }
 
-    bus_power_on();
+    clear_node_map();
 
     make_request(0xFFu, 'W', 0, frame, sizeof(frame));
     uart_write_frame(frame);
@@ -1013,7 +1083,6 @@ static void cmd_who(void)
         }
 
         if (!parse_reply_line(&node, &reply_cmd, &arg0, &arg1)) {
-            bus_power_off();
             return;
         }
 
@@ -1029,8 +1098,6 @@ static void cmd_who(void)
             break;
         }
     }
-
-    bus_power_off();
 
     g_regs[REG_NODE_COUNT] = count;
     g_regs[REG_REPLY_CMD] = 'W';
@@ -1052,7 +1119,9 @@ static void cmd_ping(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(node,
                                  'P',
@@ -1062,11 +1131,8 @@ static void cmd_ping(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     if (reply_cmd != 'A') {
         set_result(RESULT_RS485_BAD_REPLY);
@@ -1101,7 +1167,9 @@ static void cmd_set_channel(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(node,
                                  cmd,
@@ -1111,11 +1179,8 @@ static void cmd_set_channel(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     g_regs[REG_REPLY_NODE] = reply_node;
     g_regs[REG_REPLY_CMD] = (uint8_t)reply_cmd;
@@ -1151,7 +1216,9 @@ static void cmd_get_channel_status(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(node,
                                  'S',
@@ -1161,11 +1228,8 @@ static void cmd_get_channel_status(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     g_regs[REG_REPLY_NODE] = reply_node;
     g_regs[REG_REPLY_CMD] = (uint8_t)reply_cmd;
@@ -1204,7 +1268,9 @@ static void cmd_get_node_version(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(node,
                                  'V',
@@ -1214,11 +1280,8 @@ static void cmd_get_node_version(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     if (reply_cmd != 'V') {
         set_result(RESULT_RS485_BAD_REPLY);
@@ -1269,7 +1332,9 @@ static void cmd_identify(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(node,
                                  'I',
@@ -1279,11 +1344,8 @@ static void cmd_identify(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     if (reply_cmd != 'A') {
         set_result(RESULT_RS485_BAD_REPLY);
@@ -1300,7 +1362,9 @@ static void cmd_cancel(void)
 {
     char frame[8];
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     make_request(0xFFu, 'X', 0, frame, sizeof(frame));
     uart_write_frame(frame);
@@ -1308,8 +1372,6 @@ static void cmd_cancel(void)
     for (uint8_t i = 0u; i < RS485_CANCEL_GRACE_MS; i++) {
         _delay_ms(1);
     }
-
-    bus_power_off();
 
     g_regs[REG_REPLY_CMD] = (uint8_t)'X';
     set_result(RESULT_OK);
@@ -1329,7 +1391,9 @@ static void cmd_config(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(node,
                                  'M',
@@ -1339,11 +1403,8 @@ static void cmd_config(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     if (reply_cmd != 'A') {
         set_result(RESULT_RS485_BAD_REPLY);
@@ -1369,7 +1430,9 @@ static void cmd_assign(void)
         return;
     }
 
-    bus_power_on();
+    if (!require_field_power()) {
+        return;
+    }
 
     if (!send_request_wait_reply(new_node,
                                  'N',
@@ -1379,11 +1442,8 @@ static void cmd_assign(void)
                                  &reply_cmd,
                                  &arg0,
                                  &arg1)) {
-        bus_power_off();
         return;
     }
-
-    bus_power_off();
 
     if (reply_cmd != 'A') {
         set_result(RESULT_RS485_BAD_REPLY);
@@ -1395,11 +1455,41 @@ static void cmd_assign(void)
     set_result(RESULT_OK);
 }
 
+/** @brief Execute CMD_CLOSE_ALL. */
+static void cmd_close_all(void)
+{
+    char frame[8];
+
+    if (!require_field_power()) {
+        return;
+    }
+
+    /*
+     * Broadcast close-all. No replies are expected.
+     * Valve-node firmware must treat broadcast C with no channel argument as
+     * close every local valve channel.
+     */
+    make_request(0xFFu, 'C', 0, frame, sizeof(frame));
+    uart_write_frame(frame);
+
+    /*
+     * Hold field power long enough for nodes to receive the frame and pulse
+     * their local latching solenoids before the host is likely to power down.
+     */
+    for (uint8_t i = 0u; i < RS485_CLOSE_ALL_GRACE_MS; i++) {
+        _delay_ms(1);
+    }
+
+    g_regs[REG_REPLY_CMD] = (uint8_t)'C';
+    set_result(RESULT_OK);
+}
+
 /** @brief Execute CMD_CLEAR_ERROR. */
 static void cmd_clear_error(void)
 {
     g_regs[REG_STATUS] &= (uint8_t)~STATUS_ERROR;
-    set_result(RESULT_OK);
+    g_regs[REG_RESULT] = RESULT_OK;
+    update_fault_outputs();
 }
 
 /** @brief Execute CMD_SET_ERROR. */
@@ -1407,7 +1497,7 @@ static void cmd_set_error(void)
 {
     g_regs[REG_STATUS] |= STATUS_ERROR;
     g_regs[REG_RESULT] = RESULT_OK;
-    update_fault_led();
+    update_fault_outputs();
 }
 
 /**
@@ -1419,12 +1509,6 @@ static void execute_command(uint8_t cmd)
 {
     g_regs[REG_STATUS] |= STATUS_BUSY;
     clear_reply_regs();
-
-    if (fault_input_active() && cmd != CMD_CLEAR_ERROR && cmd != CMD_POWER_OFF) {
-        set_result(RESULT_FAULT_INPUT_ACTIVE);
-        g_regs[REG_STATUS] &= (uint8_t)~STATUS_BUSY;
-        return;
-    }
 
     switch (cmd) {
     case CMD_NONE:
@@ -1483,6 +1567,10 @@ static void execute_command(uint8_t cmd)
         cmd_set_error();
         break;
 
+    case CMD_CLOSE_ALL:
+        cmd_close_all();
+        break;
+
     default:
         set_result(RESULT_BAD_COMMAND);
         break;
@@ -1520,8 +1608,16 @@ ISR(TWI_vect)
 
     case TW_SR_SLA_ACK:
     case TW_SR_GCALL_ACK:
+        /*
+         * A new slave-receive transaction is starting.
+         * The first data byte received will be the register pointer.
+         */
         g_have_reg_ptr = false;
-        TWCR = (1u << TWINT) | (1u << TWEA) | (1u << TWEN) | (1u << TWIE);
+
+        TWCR = (1u << TWINT) |
+               (1u << TWEA)  |
+               (1u << TWEN)  |
+               (1u << TWIE);
         break;
 
     case TW_SR_DATA_ACK:
@@ -1529,9 +1625,15 @@ ISR(TWI_vect)
         uint8_t data = TWDR;
 
         if (!g_have_reg_ptr) {
+            /*
+             * First byte after SLA+W is the register pointer.
+             */
             g_reg_ptr = data;
             g_have_reg_ptr = true;
         } else {
+            /*
+             * Additional bytes write sequential registers.
+             */
             g_regs[g_reg_ptr] = data;
 
             if (g_reg_ptr == REG_COMMAND) {
@@ -1541,40 +1643,95 @@ ISR(TWI_vect)
                 } else {
                     g_regs[REG_RESULT] = RESULT_BUSY;
                     g_regs[REG_STATUS] |= STATUS_ERROR;
-                    update_fault_led();
+                    update_fault_outputs();
                 }
             }
 
             g_reg_ptr++;
         }
 
-        TWCR = (1u << TWINT) | (1u << TWEA) | (1u << TWEN) | (1u << TWIE);
+        TWCR = (1u << TWINT) |
+               (1u << TWEA)  |
+               (1u << TWEN)  |
+               (1u << TWIE);
         break;
     }
 
     case TW_SR_STOP:
+        /*
+         * End of write transaction.
+         *
+         * Do not clear g_reg_ptr here. A following read transaction may depend
+         * on the register pointer just written by the host.
+         */
         g_have_reg_ptr = false;
-        TWCR = (1u << TWINT) | (1u << TWEA) | (1u << TWEN) | (1u << TWIE);
+
+        TWCR = (1u << TWINT) |
+               (1u << TWEA)  |
+               (1u << TWEN)  |
+               (1u << TWIE);
         break;
 
     case TW_ST_SLA_ACK:
-    case TW_ST_DATA_ACK:
-        TWDR = g_regs[g_reg_ptr];
+        /*
+         * SLA+R received. Load the first byte for this read transaction.
+         */
+        if (g_reg_ptr == REG_VERSION_HI) {
+            TWDR = MASTER_VERSION_HI;
+        } else if (g_reg_ptr == REG_VERSION_LO) {
+            TWDR = MASTER_VERSION_LO;
+        } else {
+            TWDR = g_regs[g_reg_ptr];
+        }
+
         g_reg_ptr++;
-        TWCR = (1u << TWINT) | (1u << TWEA) | (1u << TWEN) | (1u << TWIE);
+
+        TWCR = (1u << TWINT) |
+               (1u << TWEA)  |
+               (1u << TWEN)  |
+               (1u << TWIE);
+        break;
+
+    case TW_ST_DATA_ACK:
+        /*
+         * Previous byte was ACKed by the master. Load the next byte.
+         */
+        if (g_reg_ptr == REG_VERSION_HI) {
+            TWDR = MASTER_VERSION_HI;
+        } else if (g_reg_ptr == REG_VERSION_LO) {
+            TWDR = MASTER_VERSION_LO;
+        } else {
+            TWDR = g_regs[g_reg_ptr];
+        }
+
+        g_reg_ptr++;
+
+        TWCR = (1u << TWINT) |
+               (1u << TWEA)  |
+               (1u << TWEN)  |
+               (1u << TWIE);
         break;
 
     case TW_ST_DATA_NACK:
     case TW_ST_LAST_DATA:
-        TWCR = (1u << TWINT) | (1u << TWEA) | (1u << TWEN) | (1u << TWIE);
+        /*
+         * Master is done reading.
+         */
+        TWCR = (1u << TWINT) |
+               (1u << TWEA)  |
+               (1u << TWEN)  |
+               (1u << TWIE);
         break;
 
     case TW_BUS_ERROR:
     default:
+        /*
+         * Recover from illegal START/STOP condition.
+         */
         TWCR = (1u << TWSTO) |
                (1u << TWINT) |
-               (1u << TWEN) |
-               (1u << TWEA) |
+               (1u << TWEN)  |
+               (1u << TWEA)  |
                (1u << TWIE);
         break;
     }
@@ -1594,8 +1751,18 @@ static void regs_init(void)
     g_regs[REG_STATUS] = 0u;
     g_regs[REG_RESULT] = RESULT_OK;
     g_regs[REG_POWER_STATE] = 0u;
+
+    /*
+     * Also store version in g_regs for ordinary register inspection.
+     * The TWI ISR returns these two registers directly from constants too.
+     */
     g_regs[REG_VERSION_HI] = MASTER_VERSION_HI;
     g_regs[REG_VERSION_LO] = MASTER_VERSION_LO;
+
+    g_reg_ptr = 0u;
+    g_have_reg_ptr = false;
+    g_pending_cmd = CMD_NONE;
+    g_cmd_pending = false;
 
     clear_reply_regs();
     clear_node_map();
@@ -1617,8 +1784,21 @@ int main(void)
     uart_init();
     i2c_init();
 
+    /*
+     * Safe idle outputs.
+     *
+     * Do not call bus_power_off() here. That function pulses the latching
+     * relay RESET coil. During firmware/debug cycles, reset should not
+     * repeatedly fire relay coils.
+     */
     relay_drive_off();
-    bus_power_off();
+
+    g_regs[REG_POWER_STATE] = 0u;
+    g_regs[REG_STATUS] &= (uint8_t)~STATUS_POWER_ON;
+    g_regs[REG_STATUS] &= (uint8_t)~STATUS_BUSY;
+    g_regs[REG_STATUS] &= (uint8_t)~STATUS_ERROR;
+    g_regs[REG_RESULT] = RESULT_OK;
+    update_fault_outputs();
 
     sei();
 
@@ -1635,6 +1815,6 @@ int main(void)
             execute_command(cmd);
         }
 
-        update_fault_led();
+        update_fault_outputs();
     }
 }

@@ -587,6 +587,13 @@ static void valve_pulse_close(uint8_t channel)
     }
 }
 
+static void valve_close_all(void)
+{
+    valve_pulse_close(1u);
+    _delay_ms(20);
+    valve_pulse_close(2u);
+}
+
 /* ============================================================================
  * CONFIG MODE CONTROL
  * ========================================================================== */
@@ -1048,24 +1055,43 @@ static void handle_command(uint8_t addr, char cmd, char arg)
             }
             break;
 
-        case 'C':
-        case 'c':
-            if (addr == NODE_BROADCAST_ADDR) {
-                return;
-            }
+            case 'C':
+            case 'c':
+                if (addr == NODE_BROADCAST_ADDR) {
+                    if (g_node_addr == NODE_INVALID_ADDR) {
+                        return;
+                    }
 
-            if (arg == '1') {
-                valve_pulse_close(1u);
-                send_reply(g_node_addr, 'A', 0, 0);
-                handled = true;
-            } else if (arg == '2') {
-                valve_pulse_close(2u);
-                send_reply(g_node_addr, 'A', 0, 0);
-                handled = true;
-            } else {
-                send_reply(g_node_addr, 'E', 0, 0);
-            }
-            break;
+                    if (arg != 0) {
+                        return;
+                    }
+
+                    for (uint8_t i = 0u; i < g_node_addr; i++) {
+                        _delay_ms(WHO_SLOT_MS);
+                    }
+
+                    valve_close_all();
+
+                    /*
+                     * No reply to broadcast close-all.
+                     * Avoid reply collisions.
+                     */
+                    handled = true;
+                    break;
+                }
+
+                if (arg == '1') {
+                    valve_pulse_close(1u);
+                    send_reply(g_node_addr, 'A', 0, 0);
+                    handled = true;
+                } else if (arg == '2') {
+                    valve_pulse_close(2u);
+                    send_reply(g_node_addr, 'A', 0, 0);
+                    handled = true;
+                } else {
+                    send_reply(g_node_addr, 'E', 0, 0);
+                }
+                break;
 
         case 'S':
         case 's':

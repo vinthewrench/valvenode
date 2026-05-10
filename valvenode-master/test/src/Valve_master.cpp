@@ -392,6 +392,23 @@ bool Valve_master::powerOff()
 }
 
 /**
+ * @brief Broadcast close-all to all valve nodes.
+ *
+ * This requires field power to already be on. The master firmware sends
+ * :FFC\r on the RS-485 bus and does not expect individual node replies.
+ *
+ * @return true on success.
+ */
+bool Valve_master::closeAll()
+{
+    if (!submitCommandAndWait(CMD_CLOSE_ALL, 1000)) {
+        return false;
+    }
+
+    return checkResultOk("closeAll");
+}
+
+/**
  * @brief Ping a node.
  *
  * @param node RS485 node address, valid range 1-254.
