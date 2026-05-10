@@ -522,18 +522,22 @@ static void valve_driver_off(uint8_t channel)
 /**
  * @brief Pulse one valve channel in the open direction.
  *
+ * Hardware note:
+ *   The latching solenoid polarity is reversed from the original firmware
+ *   assumption. OPEN is INB high / INA low.
+ *
  * @param channel Valve channel number, 1 or 2.
  */
 static void valve_pulse_open(uint8_t channel)
 {
     if (channel == 1u) {
-        VNH1_PORT |= (1u << VNH1_INA_BIT);
-        VNH1_PORT &= (uint8_t)~(1u << VNH1_INB_BIT);
+        VNH1_PORT &= (uint8_t)~(1u << VNH1_INA_BIT);
+        VNH1_PORT |= (1u << VNH1_INB_BIT);
         _delay_us(20);
         VNH1_PWM_PORT |= (1u << VNH1_PWM_BIT);
     } else {
-        VNH2_PORT |= (1u << VNH2_INA_BIT);
-        VNH2_INB_PORT &= (uint8_t)~(1u << VNH2_INB_BIT);
+        VNH2_PORT &= (uint8_t)~(1u << VNH2_INA_BIT);
+        VNH2_INB_PORT |= (1u << VNH2_INB_BIT);
         _delay_us(20);
         VNH2_PWM_PORT |= (1u << VNH2_PWM_BIT);
     }
@@ -556,18 +560,22 @@ static void valve_pulse_open(uint8_t channel)
 /**
  * @brief Pulse one valve channel in the close direction.
  *
+ * Hardware note:
+ *   The latching solenoid polarity is reversed from the original firmware
+ *   assumption. CLOSE is INA high / INB low.
+ *
  * @param channel Valve channel number, 1 or 2.
  */
 static void valve_pulse_close(uint8_t channel)
 {
     if (channel == 1u) {
-        VNH1_PORT &= (uint8_t)~(1u << VNH1_INA_BIT);
-        VNH1_PORT |= (1u << VNH1_INB_BIT);
+        VNH1_PORT |= (1u << VNH1_INA_BIT);
+        VNH1_PORT &= (uint8_t)~(1u << VNH1_INB_BIT);
         _delay_us(20);
         VNH1_PWM_PORT |= (1u << VNH1_PWM_BIT);
     } else {
-        VNH2_PORT &= (uint8_t)~(1u << VNH2_INA_BIT);
-        VNH2_INB_PORT |= (1u << VNH2_INB_BIT);
+        VNH2_PORT |= (1u << VNH2_INA_BIT);
+        VNH2_INB_PORT &= (uint8_t)~(1u << VNH2_INB_BIT);
         _delay_us(20);
         VNH2_PWM_PORT |= (1u << VNH2_PWM_BIT);
     }

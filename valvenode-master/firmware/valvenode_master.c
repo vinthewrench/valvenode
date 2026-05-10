@@ -127,7 +127,7 @@
 #define RS485_RX_TO_TX_TURNAROUND_MS 2u
 
 /** @brief Normal command reply timeout in milliseconds. */
-#define RS485_NORMAL_TIMEOUT_MS       250u
+#define RS485_NORMAL_TIMEOUT_MS       1000u
 
 /** @brief WHO discovery timeout in milliseconds. */
 #define RS485_WHO_TIMEOUT_MS          6000u
