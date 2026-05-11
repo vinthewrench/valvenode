@@ -1,7 +1,5 @@
 # ValveNode
 
-# ValveNode
-
 ValveNode is a wired field-bus irrigation valve-control system for my Raspberry Pi farm automation stack.
 
 This project is a continuation of the work described in [Off-Grid Farm Automation with Raspberry Pi](https://www.vinthewrench.com/p/off-grid-farm-automation-raspberry-pi).
@@ -167,6 +165,8 @@ The firmware implements the production Valve Master behavior:
 - Result and reply registers
 - Fault/status reporting
 
+Directed RS-485 commands include timeout handling and retry behavior. A single missed node reply should not turn into an immediate hard failure on a slow irrigation field bus.
+
 Build:
 
 ~~~bash
@@ -260,6 +260,86 @@ cd valvenode-master/test
 make
 ~~~
 
+Common `valve` commands:
+
+~~~bash
+./valve status
+./valve power on
+./valve power off
+./valve who
+./valve map
+./valve ping 1
+./valve set 1 1 on
+./valve set 1 1 off
+./valve channel 1 1 status
+./valve version master
+./valve version 1
+./valve identify 1
+./valve cancel
+~~~
+
+Provisioning commands:
+
+~~~bash
+./valve config
+./valve assign 7
+./valve move 7 8
+~~~
+
+### Hammer Test
+
+Path:
+
+~~~text
+valvenode-master/test/hammer.sh
+~~~
+
+`hammer.sh` repeatedly exercises the full Valve Master path.
+
+Test pattern:
+
+~~~text
+power on
+ping nodes
+initial status nodes
+loop:
+  set ON nodes
+  status nodes
+  set OFF nodes
+  status nodes
+final status nodes
+power off
+~~~
+
+Example:
+
+~~~bash
+cd valvenode-master/test
+./hammer.sh 25
+NODES="1 3 4 5 6" CHANNEL=1 ./hammer.sh 500
+~~~
+
+Optional settings:
+
+~~~bash
+CHANNEL=2 ./hammer.sh 25
+VERBOSE=1 ./hammer.sh 25
+VALVE_BIN=./valve ./hammer.sh 25
+NODES="1 3 4 5 6" ./hammer.sh 25
+RETRY_ON_FAIL=1 ./hammer.sh 25
+~~~
+
+Recent bench result:
+
+~~~text
+500 loops
+5 nodes tested: 1 3 4 5 6
+channel 1
+10,016 commands
+0 failures
+100% first-try pass rate
+~~~
+
 Generate local Doxygen docs:
 
 ~~~bash
@@ -308,6 +388,7 @@ CMD_CONFIG
 CMD_ASSIGN
 CMD_CLEAR_ERROR
 CMD_SET_ERROR
+CMD_CLOSE_ALL
 ~~~
 
 Important status bits include:
@@ -330,6 +411,10 @@ RESULT_UNSUPPORTED_CHANNEL
 RESULT_CONFIG_REQUIRED
 RESULT_ADDRESS_IN_USE
 RESULT_BUSY
+RESULT_RS485_TIMEOUT
+RESULT_RS485_BAD_CHECKSUM
+RESULT_RS485_BAD_REPLY
+RESULT_POWER_OFF
 ~~~
 
 ## Valve Node
@@ -469,7 +554,9 @@ makefile
 src/main.cpp
 ~~~
 
-The test tool is used for bench testing the valve-node command protocol.
+The `vnode` utility is used for direct bench testing of valve nodes over a serial port. It assumes the computer is connected to the RS-485 bus through a USB-to-RS-485 adapter.
+
+This bypasses the Valve Master and talks directly to the nodes.
 
 Build:
 
@@ -477,6 +564,28 @@ Build:
 cd valvenode-slave/test
 make
 ~~~
+
+Example:
+
+~~~bash
+./vnode -d /dev/ttyUSB0 who
+./vnode -d /dev/ttyUSB0 ping 1
+./vnode -d /dev/ttyUSB0 open 1 1
+./vnode -d /dev/ttyUSB0 close 1 1
+~~~
+
+Typical output:
+
+~~~text
+$ ./vnode -d /dev/ttyUSB0 who
+device: /dev/ttyUSB0
+baud:   9600
+tx: :FFW\r
+rx: :01WB8  [checksum ok] node=1 WHO
+rx: :02WB9  [checksum ok] node=2 WHO
+~~~
+
+`vnode` can also be used to configure a fresh node, assign its address, and verify that it answers before it goes into the field.
 
 ## RS-485 Valve Node Protocol
 
@@ -562,8 +671,23 @@ The repository currently contains:
 - Valve Master hardware design
 - Valve Master firmware
 - Valve Master simulator
-- Valve Master Linux I2C test program
+- Valve Master Linux I2C test tool: `valve`
+- Valve Master hammer test: `hammer.sh`
 - Valve Node hardware revisions
 - Valve Node firmware
-- Valve Node test program
+- Valve Node direct RS-485 test tool: `vnode`
 - Protocol and design documentation
+
+Current bench status:
+
+- Valve Master can switch field power
+- Valve Master can communicate with multiple valve nodes over RS-485
+- Valve nodes respond to discovery, ping, set, and status commands
+- `hammer.sh` has completed a 500-loop, 10,016-command bench test across five nodes with zero failures
+
+Remaining validation:
+
+- Confirm final latching-solenoid open/close polarity with real valve bodies
+- Test final assembled boards in outdoor enclosures
+- Validate longer real field-cable runs
+- Continue field reliability testing before treating the system as deployed infrastructure
