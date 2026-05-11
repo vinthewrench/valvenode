@@ -341,11 +341,20 @@ static void uart_putc(char c)
  */
 static bool uart_getc_nonblocking(char *out)
 {
-    if (UCSRA & (1u << RXC)) {
-        *out = UDR;
-        return true;
+    uint8_t status;
+
+    if ((UCSRA & (1u << RXC)) == 0u) {
+        return false;
     }
-    return false;
+
+    status = UCSRA;
+    *out = UDR;
+
+    if (status & ((1u << FE) | (1u << DOR) | (1u << UPE))) {
+        return false;
+    }
+
+    return true;
 }
 
 /**
@@ -370,7 +379,7 @@ static void uart_write(const char *s)
 
     while ((UCSRA & (1u << TXC)) == 0u) {
     }
-
+    _delay_us(100);
     rs485_set_rx();
 }
 
@@ -864,12 +873,12 @@ static void send_reply(uint8_t addr, char reply_cmd, char arg0, char arg1)
 /**
  * @brief Send boot banner if node is assigned.
  */
-static void send_boot_banner(void)
-{
-    if (g_node_addr != NODE_INVALID_ADDR) {
-        send_reply(g_node_addr, 'B', 0, 0);
-    }
-}
+// static void send_boot_banner(void)
+// {
+//     if (g_node_addr != NODE_INVALID_ADDR) {
+//         send_reply(g_node_addr, 'B', 0, 0);
+//     }
+// }
 
 /**
  * @brief Send firmware version reply.
@@ -1039,8 +1048,9 @@ static void handle_command(uint8_t addr, char cmd, char arg)
                 return;
             }
 
-            led_flash_short();
             send_reply(g_node_addr, 'A', 0, 0);
+            led_flash_short();
+
             handled = true;
             break;
 
@@ -1106,8 +1116,6 @@ static void handle_command(uint8_t addr, char cmd, char arg)
             if (addr == NODE_BROADCAST_ADDR) {
                 return;
             }
-
-            led_flash_short();
 
             if (arg == '1') {
                 send_reply(g_node_addr,
@@ -1281,7 +1289,7 @@ int main(void)
 
     startup_blink();
 
-    send_boot_banner();
+   // send_boot_banner();
 
     for (;;) {
         serial_poll();

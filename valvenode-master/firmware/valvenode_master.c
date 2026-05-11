@@ -68,7 +68,7 @@
 #define MASTER_VERSION_HI           0x01u
 
 /** @brief Master firmware version low byte. */
-#define MASTER_VERSION_LO           0x03u
+#define MASTER_VERSION_LO           0x04u
 
 /** @brief Highest valid assigned valve-node address. */
 #define MAX_NODE_ADDR               254u
@@ -141,6 +141,11 @@
 /** @brief Maximum received RS-485 line length including ':' and NUL. */
 #define RX_LINE_MAX                 24u
 
+/** @brief Number of directed RS-485 retries after an initial failed attempt. */
+#define RS485_RETRY_COUNT             1u
+
+/** @brief Delay before retrying a directed RS-485 request. */
+#define RS485_RETRY_DELAY_MS          100u
 /* ============================================================================
  * I2C register map
  * ========================================================================== */
@@ -978,14 +983,31 @@ static bool wait_for_reply(uint16_t timeout_ms,
 
     while (read_line_timeout(timeout_ms)) {
         if (!parse_reply_line(&node, &cmd, &arg0, &arg1)) {
+            /*
+             * parse_reply_line() sets RESULT_RS485_BAD_CHECKSUM itself
+             * when the checksum is wrong. Other parse failures are malformed
+             * replies.
+             */
+            if (g_regs[REG_RESULT] != RESULT_RS485_BAD_CHECKSUM) {
+                set_result(RESULT_RS485_BAD_REPLY);
+            }
+
             return false;
         }
 
         if ((expected_node != 0u) && (node != expected_node)) {
+            /*
+             * Valid reply, but not the node we are waiting for.
+             * Keep listening until timeout.
+             */
             continue;
         }
 
         if ((expected_cmd != 0) && (cmd != expected_cmd)) {
+            /*
+             * Valid reply, but not the command we are waiting for.
+             * Keep listening until timeout.
+             */
             continue;
         }
 
@@ -1003,6 +1025,9 @@ static bool wait_for_reply(uint16_t timeout_ms,
 
 /**
  * @brief Send a request and wait for one reply from that node.
+ *
+ * Directed requests are retried once by default. A single missed reply should
+ * not turn into a hard failure on a slow irrigation control bus.
  *
  * @param node Destination and expected reply node.
  * @param cmd Command character.
@@ -1026,9 +1051,44 @@ static bool send_request_wait_reply(uint8_t node,
     char frame[8];
 
     make_request(node, cmd, arg, frame, sizeof(frame));
-    uart_write_frame(frame);
 
-    return wait_for_reply(timeout_ms, node, 0, reply_node, reply_cmd, reply_arg0, reply_arg1);
+    for (uint8_t attempt = 0u; attempt <= RS485_RETRY_COUNT; attempt++) {
+        /*
+         * Start each attempt with a clean receive side and clean reply
+         * registers. If this attempt succeeds, the command handler will copy
+         * the returned values into the public reply registers.
+         */
+        uart_flush_rx();
+        clear_reply_regs();
+
+        uart_write_frame(frame);
+
+        if (wait_for_reply(timeout_ms,
+                           node,
+                           0,
+                           reply_node,
+                           reply_cmd,
+                           reply_arg0,
+                           reply_arg1)) {
+            return true;
+        }
+
+        /*
+         * Only retry timeouts. Bad checksum or malformed reply means something
+         * real was received, and hiding that with a retry makes debugging worse.
+         */
+        if (g_regs[REG_RESULT] != RESULT_RS485_TIMEOUT) {
+            return false;
+        }
+
+        if (attempt < RS485_RETRY_COUNT) {
+            for (uint8_t i = 0u; i < RS485_RETRY_DELAY_MS; i++) {
+                _delay_ms(1);
+            }
+        }
+    }
+
+    return false;
 }
 
 /* ============================================================================

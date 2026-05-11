@@ -8,7 +8,7 @@
 # Project Configuration
 # ------------------------------------------------------------
 
-FW_VERSION_BCD := 0x0100
+FW_VERSION_BCD := 0x0102
 
 PROJECT := valvenode
 MCU     := attiny4313

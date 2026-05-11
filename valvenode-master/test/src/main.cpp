@@ -295,6 +295,23 @@ static void print_failure_status(const char* what)
         std::fprintf(stderr, "%s failed\n", what);
     }
 
+    Valve_master::Reply reply{};
+    if (gDevice.getReply(reply)) {
+        std::fprintf(stderr,
+                     "last reply: node=%u cmd=0x%02X",
+                     reply.node,
+                     reply.cmd);
+
+        if (reply.cmd >= 32 && reply.cmd <= 126) {
+            std::fprintf(stderr, " '%c'", static_cast<char>(reply.cmd));
+        }
+
+        std::fprintf(stderr,
+                     " arg0=0x%02X arg1=0x%02X\n",
+                     reply.arg0,
+                     reply.arg1);
+    }
+
     if (gDebug_flag || gVerbose_flag) {
         print_status();
     }
