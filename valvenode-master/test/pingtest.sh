@@ -7,10 +7,7 @@
 # Pattern:
 #   power on
 #   loop:
-#     ping node 1
-#     ping node 2
-#     ping node 3
-#     ping node 4
+#     ping configured nodes
 #   power off
 #
 # Usage:
@@ -21,23 +18,38 @@
 # Optional:
 #   NODES="1 2 3 4" ./ping_hammer.sh 100
 #   VERBOSE=1 ./ping_hammer.sh 100
-#   VALVE_BIN=./valve ./ping_hammer.sh 100
+#   VALVE_BIN=/path/to/valve ./ping_hammer.sh 100
+#
+# Valve binary search priority:
+#   1. VALVE_BIN override
+#   2. ./valve in current directory
+#   3. valve from PATH
 
 set -u
 
-VALVE_BIN="${VALVE_BIN:-./valve}"
+if [[ -n "${VALVE_BIN:-}" ]]; then
+    VALVE_BIN="$VALVE_BIN"
+elif [[ -x "./valve" ]]; then
+    VALVE_BIN="./valve"
+else
+    VALVE_BIN="$(command -v valve || true)"
+fi
+
 LOOPS="${1:-100}"
 VERBOSE="${VERBOSE:-0}"
 
 # Override like:
 #   NODES="2" ./ping_hammer.sh 100
-#   NODES="1 2 3 4" ./ping_hammer.sh 100
-NODES_TEXT="${NODES:-1 3 4 5 6}"
+#   NODES="1 2 3 4 5 6" ./ping_hammer.sh 100
+NODES_TEXT="${NODES:-1 2 3 4 5 6}"
 read -r -a NODES_ARR <<< "$NODES_TEXT"
 
-POWER_SETTLE_SEC=1
-BETWEEN_COMMAND_SEC=0.10
-BETWEEN_LOOPS_SEC=0.25
+POWER_SETTLE_SEC="${POWER_SETTLE_SEC:-1}"
+BETWEEN_COMMAND_SEC="${BETWEEN_COMMAND_SEC:-0.10}"
+BETWEEN_LOOPS_SEC="${BETWEEN_LOOPS_SEC:-0.25}"
+
+TMP_OUT="/tmp/ping_hammer_last.out"
+TMP_ERR="/tmp/ping_hammer_last.err"
 
 pass_count=0
 fail_count=0
@@ -50,10 +62,18 @@ current_phase="startup"
 interrupted=0
 cleaned_up=0
 
+timestamp()
+{
+    date "+%Y-%m-%d %H:%M:%S"
+}
+
 run_cmd()
 {
     local label="$1"
     shift
+
+    : >"$TMP_OUT"
+    : >"$TMP_ERR"
 
     if [[ "$VERBOSE" != "0" ]]; then
         echo
@@ -61,7 +81,7 @@ run_cmd()
         echo "+ $*"
         "$@"
     else
-        "$@" >/tmp/ping_hammer_last.out 2>/tmp/ping_hammer_last.err
+        "$@" >"$TMP_OUT" 2>"$TMP_ERR"
     fi
 
     local rc=$?
@@ -74,13 +94,13 @@ run_cmd()
     fail_count=$((fail_count + 1))
 
     local err=""
-    if [[ -s /tmp/ping_hammer_last.err ]]; then
-        err="$(tr '\n' ' ' < /tmp/ping_hammer_last.err)"
-    elif [[ -s /tmp/ping_hammer_last.out ]]; then
-        err="$(tr '\n' ' ' < /tmp/ping_hammer_last.out)"
+    if [[ -s "$TMP_ERR" ]]; then
+        err="$(tr '\n' ' ' < "$TMP_ERR")"
+    elif [[ -s "$TMP_OUT" ]]; then
+        err="$(tr '\n' ' ' < "$TMP_OUT")"
     fi
 
-   fail_log+=("time='$(date "+%Y-%m-%d %H:%M:%S")' loop=${current_loop} phase='${current_phase}' label='${label}' rc=${rc} cmd='$*' output='${err}'")
+    fail_log+=("time='$(timestamp)' loop=${current_loop} phase='${current_phase}' label='${label}' rc=${rc} cmd='$*' output='${err}'")
 
     return "$rc"
 }
@@ -146,7 +166,7 @@ cleanup()
 
     print_summary
 
-    rm -f /tmp/ping_hammer_last.out /tmp/ping_hammer_last.err
+    rm -f "$TMP_OUT" "$TMP_ERR"
 }
 
 handle_interrupt()
@@ -161,10 +181,28 @@ handle_interrupt()
 trap handle_interrupt INT TERM
 trap cleanup EXIT
 
-if [[ ! -x "$VALVE_BIN" ]]; then
-    echo "ERROR: $VALVE_BIN not found or not executable"
+if [[ -z "$VALVE_BIN" ]] || [[ ! -x "$VALVE_BIN" ]]; then
+    echo "ERROR: valve not found or not executable"
+    echo "Set VALVE_BIN=/path/to/valve, put ./valve in this directory, or make sure valve is in your PATH."
     exit 1
 fi
+
+if ! [[ "$LOOPS" =~ ^[0-9]+$ ]] || [[ "$LOOPS" -lt 1 ]]; then
+    echo "ERROR: loop count must be >= 1"
+    exit 1
+fi
+
+if [[ "${#NODES_ARR[@]}" -lt 1 ]]; then
+    echo "ERROR: at least one node must be specified"
+    exit 1
+fi
+
+for node in "${NODES_ARR[@]}"; do
+    if ! [[ "$node" =~ ^[0-9]+$ ]] || [[ "$node" -lt 1 ]] || [[ "$node" -gt 254 ]]; then
+        echo "ERROR: node must be 1..254: $node"
+        exit 1
+    fi
+done
 
 echo "Valve bus ping hammer test"
 echo "  valve binary: $VALVE_BIN"
@@ -207,4 +245,3 @@ if [[ "$fail_count" -eq 0 ]]; then
 fi
 
 exit 1
-

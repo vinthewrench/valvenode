@@ -46,6 +46,7 @@
  *   - :00M   put an unassigned node into config mode
  *   - :DDN   assign new address DD while node is in config mode
  *   - :FFW   broadcast who
+ *   - :FFC   broadcast close all local valves
  *   - :FFX   broadcast cancel config / identify mode
  *
  * Example replies:
@@ -59,7 +60,7 @@
  *   - :04R2CKK     node 04 valve 2 closed
  *
  * Example version reply:
- *   - :04V01004B   node 04 firmware version 1.00
+ *   - :04V010580   node 04 firmware version 1.05
  *
  * Checksum:
  *   8-bit sum of ASCII body bytes modulo 256.
@@ -71,13 +72,20 @@
  *   - Replies always include checksum
  *   - Requests may omit checksum
  *   - Node address is stored in EEPROM and copied into RAM at boot
+ *   - EEPROM identity uses one packed magic/address/inverse-address record
+ *   - Fresh blank EEPROM is treated as unassigned, not corrupt
+ *   - Corrupt EEPROM identity causes fast address-fault LED blink
  *   - Protocol is strict command/response, one request then one reply
+ *   - Valve pulse width is 20 ms
+ *   - Production valve output uses a 2.2 ohm series resistor
+ *   - Watchdog is enabled to recover from firmware hangs during valve pulses
  */
 
 #define F_CPU 8000000UL
 
 #include <avr/eeprom.h>
 #include <avr/io.h>
+#include <avr/wdt.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <util/delay.h>
@@ -91,14 +99,19 @@
  *
  * Example:
  *   0x0100 = 1.00
+ *   0x0104 = 1.04
+ *   0x0105 = 1.05
  *   0x0215 = 2.15
  */
 #ifndef FW_VERSION
-#define FW_VERSION 0x0100
+#define FW_VERSION 0x0106
 #endif
 
 /** @brief Default runtime address for an unassigned node. */
 #define DEFAULT_NODE_ADDR              0x00
+
+/** @brief EEPROM identity record magic byte. */
+#define EEPROM_ADDR_MAGIC              0xA5u
 
 /** @brief UART baud rate. */
 #define BAUD                           9600UL
@@ -106,8 +119,14 @@
 /** @brief UART divisor for F_CPU and BAUD. */
 #define UBRR_VALUE                     ((F_CPU / (16UL * BAUD)) - 1UL)
 
-/** @brief Valve drive pulse width in milliseconds. */
-#define VALVE_PULSE_MS                 50
+/**
+ * @brief Valve drive pulse width in milliseconds.
+ *
+ * Production valve output uses a 2.2 ohm series resistor with the latching
+ * solenoid. The shorter pulse limits solenoid heating while still providing
+ * enough energy to latch the valve.
+ */
+#define VALVE_PULSE_MS                 20
 
 /** @brief RX-to-TX turnaround delay before transmitting reply. */
 #define RS485_RX_TO_TX_TURNAROUND_MS   2
@@ -129,6 +148,9 @@
 
 /** @brief Config mode LED half-period, 1 s on and 1 s off. */
 #define CONFIG_BLINK_HALF_MS           1000u
+
+/** @brief Address-fault LED half-period in milliseconds. */
+#define ADDR_FAULT_BLINK_HALF_MS       100u
 
 /** @brief Main loop poll tick in milliseconds. */
 #define POLL_TICK_MS                   1u
@@ -211,6 +233,31 @@ typedef enum
     VALVE_CLOSED       /**< Valve was last commanded closed. */
 } valve_state_t;
 
+/**
+ * @brief EEPROM node-address load result.
+ */
+typedef enum
+{
+    ADDR_LOAD_VALID = 0,       /**< EEPROM contained a valid assigned address. */
+    ADDR_LOAD_UNASSIGNED,      /**< EEPROM is blank/new/unassigned. */
+    ADDR_LOAD_CORRUPT          /**< EEPROM identity record is malformed. */
+} addr_load_status_t;
+
+/**
+ * @brief EEPROM identity record.
+ *
+ * Keep this as one record so byte ordering and layout are explicit:
+ *   byte 0 = magic
+ *   byte 1 = address
+ *   byte 2 = bitwise inverse of address
+ */
+typedef struct
+{
+    uint8_t magic;
+    uint8_t addr;
+    uint8_t addr_inv;
+} node_identity_t;
+
 /** @brief Runtime state for valve channel 1. */
 static volatile valve_state_t g_valve1_state = VALVE_CLOSED;
 
@@ -238,42 +285,153 @@ static uint16_t g_identify_blink_ms = 0u;
 /** @brief Current identify mode LED state. */
 static bool g_identify_led_on = false;
 
+/** @brief Address-fault blink accumulator in milliseconds. */
+static uint16_t g_addr_fault_blink_ms = 0u;
+
+/** @brief Current address-fault LED state. */
+static bool g_addr_fault_led_on = false;
+
 /** @brief Active node address loaded from EEPROM at boot. */
 static uint8_t g_node_addr = DEFAULT_NODE_ADDR;
 
-/** @brief Node address persisted in EEPROM. */
-uint8_t EEMEM ee_node_addr;
+/** @brief Result of loading node address from EEPROM. */
+static addr_load_status_t g_addr_load_status = ADDR_LOAD_UNASSIGNED;
+
+/** @brief True when EEPROM address identity is corrupt. */
+static bool g_addr_fault = false;
+
+/** @brief Node identity persisted in EEPROM. */
+static node_identity_t EEMEM ee_node_identity;
 
 /* ============================================================================
  * EEPROM HELPERS
  * ========================================================================== */
 
 /**
- * @brief Load node address from EEPROM.
+ * @brief Validate a new address for assignment.
  *
- * Erased EEPROM reads as 0xFF. Both 0xFF and 0x00 are treated as unassigned.
- *
- * @return Runtime node address to use after boot.
+ * @param addr Candidate node address.
+ * @retval true  Address is valid assignable address.
+ * @retval false Address is invalid or broadcast.
  */
-static uint8_t load_node_addr(void)
+static bool valid_assign_addr(uint8_t addr)
 {
-    uint8_t addr = eeprom_read_byte(&ee_node_addr);
-
-    if ((addr == 0xFFu) || (addr == NODE_BROADCAST_ADDR)) {
-        return DEFAULT_NODE_ADDR;
-    }
-
-    return addr;
+    return (addr != NODE_INVALID_ADDR) && (addr != NODE_BROADCAST_ADDR);
 }
 
 /**
- * @brief Persist node address to EEPROM.
+ * @brief Load node address from EEPROM.
+ *
+ * Fresh/unassigned EEPROM is not treated as a fault. A malformed identity
+ * record is treated as a fault and should be indicated.
+ *
+ * @param[out] status Address load status.
+ * @return Runtime node address to use after boot.
+ */
+static uint8_t load_node_addr(addr_load_status_t *status)
+{
+    node_identity_t id;
+
+    eeprom_read_block(&id, &ee_node_identity, sizeof(id));
+
+    if ((id.magic == 0xFFu) &&
+        (id.addr == 0xFFu) &&
+        (id.addr_inv == 0xFFu)) {
+        *status = ADDR_LOAD_UNASSIGNED;
+        return DEFAULT_NODE_ADDR;
+    }
+
+    if ((id.magic == EEPROM_ADDR_MAGIC) &&
+        (id.addr == NODE_INVALID_ADDR) &&
+        (id.addr_inv == (uint8_t)~NODE_INVALID_ADDR)) {
+        *status = ADDR_LOAD_UNASSIGNED;
+        return DEFAULT_NODE_ADDR;
+    }
+
+    if (id.magic != EEPROM_ADDR_MAGIC) {
+        *status = ADDR_LOAD_CORRUPT;
+        return DEFAULT_NODE_ADDR;
+    }
+
+    if (!valid_assign_addr(id.addr)) {
+        *status = ADDR_LOAD_CORRUPT;
+        return DEFAULT_NODE_ADDR;
+    }
+
+    if (id.addr_inv != (uint8_t)~id.addr) {
+        *status = ADDR_LOAD_CORRUPT;
+        return DEFAULT_NODE_ADDR;
+    }
+
+    *status = ADDR_LOAD_VALID;
+    return id.addr;
+}
+
+/**
+ * @brief Persist node address to EEPROM and verify it.
  *
  * @param addr New node address to store.
+ * @return true if EEPROM verified after write.
  */
-static void save_node_addr(uint8_t addr)
+static bool save_node_addr(uint8_t addr)
 {
-    eeprom_update_byte(&ee_node_addr, addr);
+    node_identity_t id;
+    node_identity_t verify;
+
+    if (!valid_assign_addr(addr)) {
+        return false;
+    }
+
+    id.magic = EEPROM_ADDR_MAGIC;
+    id.addr = addr;
+    id.addr_inv = (uint8_t)~addr;
+
+    eeprom_update_block(&id, &ee_node_identity, sizeof(id));
+    eeprom_read_block(&verify, &ee_node_identity, sizeof(verify));
+
+    if (verify.magic != EEPROM_ADDR_MAGIC) {
+        return false;
+    }
+
+    if (verify.addr != addr) {
+        return false;
+    }
+
+    if (verify.addr_inv != (uint8_t)~addr) {
+        return false;
+    }
+
+    return true;
+}
+
+/* ============================================================================
+ * WATCHDOG / SAFE DELAY HELPERS
+ * ========================================================================== */
+
+/**
+ * @brief Enable watchdog reset protection.
+ *
+ * If firmware ever wedges while a valve driver output is active, the watchdog
+ * resets the MCU. Startup GPIO initialization must leave all VNH inputs and
+ * enable/PWM pins inactive.
+ */
+static void watchdog_init(void)
+{
+    MCUSR &= (uint8_t)~(1u << WDRF);
+    wdt_enable(WDTO_500MS);
+}
+
+/**
+ * @brief Delay in milliseconds while servicing the watchdog.
+ *
+ * @param ms Delay time in milliseconds.
+ */
+static void delay_ms_safe(uint16_t ms)
+{
+    while (ms-- > 0u) {
+        wdt_reset();
+        _delay_ms(1);
+    }
 }
 
 /* ============================================================================
@@ -301,9 +459,7 @@ static inline void rs485_set_tx(void)
  */
 static void rs485_wait_rx_to_tx_turnaround(void)
 {
-    for (uint8_t i = 0u; i < RS485_RX_TO_TX_TURNAROUND_MS; i++) {
-        _delay_ms(1);
-    }
+    delay_ms_safe(RS485_RX_TO_TX_TURNAROUND_MS);
 }
 
 /**
@@ -329,7 +485,9 @@ static void uart_init(void)
 static void uart_putc(char c)
 {
     while ((UCSRA & (1u << UDRE)) == 0u) {
+        wdt_reset();
     }
+
     UDR = c;
 }
 
@@ -378,7 +536,9 @@ static void uart_write(const char *s)
     }
 
     while ((UCSRA & (1u << TXC)) == 0u) {
+        wdt_reset();
     }
+
     _delay_us(100);
     rs485_set_rx();
 }
@@ -429,7 +589,7 @@ static void config_button_init(void)
 static void led_flash_short(void)
 {
     led_on();
-    _delay_ms(60);
+    delay_ms_safe(60u);
     led_off();
 }
 
@@ -453,6 +613,30 @@ static void exit_identify_mode(void)
     g_identify_blink_ms = 0u;
     g_identify_led_on = false;
     led_off();
+}
+
+/**
+ * @brief Service address-fault LED blinking.
+ *
+ * This is intentionally much faster than normal config blink.
+ */
+static void address_fault_blink_poll(void)
+{
+    if (!g_addr_fault) {
+        return;
+    }
+
+    g_addr_fault_blink_ms += POLL_TICK_MS;
+    if (g_addr_fault_blink_ms >= ADDR_FAULT_BLINK_HALF_MS) {
+        g_addr_fault_blink_ms = 0u;
+        g_addr_fault_led_on = !g_addr_fault_led_on;
+
+        if (g_addr_fault_led_on) {
+            led_on();
+        } else {
+            led_off();
+        }
+    }
 }
 
 /**
@@ -482,8 +666,19 @@ static void identify_mode_poll(void)
  */
 static void gpio_init(void)
 {
+    RS485_DIR_PORT &= (uint8_t)~(1u << RS485_DIR_BIT);
+
+    VNH1_PORT &= (uint8_t)~(1u << VNH1_INA_BIT);
+    VNH1_PORT &= (uint8_t)~(1u << VNH1_INB_BIT);
+    VNH1_PWM_PORT &= (uint8_t)~(1u << VNH1_PWM_BIT);
+
+    VNH2_PORT &= (uint8_t)~(1u << VNH2_INA_BIT);
+    VNH2_INB_PORT &= (uint8_t)~(1u << VNH2_INB_BIT);
+    VNH2_PWM_PORT &= (uint8_t)~(1u << VNH2_PWM_BIT);
+
+    LED_PORT |= (uint8_t)(1u << LED_BIT);
+
     RS485_DIR_DDR |= (1u << RS485_DIR_BIT);
-    rs485_set_rx();
 
     VNH1_DDR |= (1u << VNH1_INA_BIT) | (1u << VNH1_INB_BIT);
     VNH1_PWM_DDR |= (1u << VNH1_PWM_BIT);
@@ -493,28 +688,17 @@ static void gpio_init(void)
     VNH2_PWM_DDR |= (1u << VNH2_PWM_BIT);
 
     LED_DDR |= (1u << LED_BIT);
-    led_off();
 
     config_button_init();
 
-    VNH1_PORT &= (uint8_t)~(1u << VNH1_INA_BIT);
-    VNH1_PORT &= (uint8_t)~(1u << VNH1_INB_BIT);
-    VNH1_PWM_PORT &= (uint8_t)~(1u << VNH1_PWM_BIT);
-
-    VNH2_PORT &= (uint8_t)~(1u << VNH2_INA_BIT);
-    VNH2_INB_PORT &= (uint8_t)~(1u << VNH2_INB_BIT);
-    VNH2_PWM_PORT &= (uint8_t)~(1u << VNH2_PWM_BIT);
+    rs485_set_rx();
+    led_off();
 }
 
 /* ============================================================================
  * VALVE DRIVER CONTROL
  * ========================================================================== */
 
-/**
- * @brief Disable both drive inputs and PWM for one valve channel.
- *
- * @param channel Valve channel number, 1 or 2.
- */
 static void valve_driver_off(uint8_t channel)
 {
     if (channel == 1u) {
@@ -528,17 +712,10 @@ static void valve_driver_off(uint8_t channel)
     }
 }
 
-/**
- * @brief Pulse one valve channel in the open direction.
- *
- * Hardware note:
- *   The latching solenoid polarity is reversed from the original firmware
- *   assumption. OPEN is INB high / INA low.
- *
- * @param channel Valve channel number, 1 or 2.
- */
 static void valve_pulse_open(uint8_t channel)
 {
+    valve_driver_off(channel);
+
     if (channel == 1u) {
         VNH1_PORT &= (uint8_t)~(1u << VNH1_INA_BIT);
         VNH1_PORT |= (1u << VNH1_INB_BIT);
@@ -552,9 +729,7 @@ static void valve_pulse_open(uint8_t channel)
     }
 
     led_on();
-    for (uint8_t i = 0u; i < VALVE_PULSE_MS; i++) {
-        _delay_ms(1);
-    }
+    delay_ms_safe(VALVE_PULSE_MS);
     led_off();
 
     valve_driver_off(channel);
@@ -566,17 +741,10 @@ static void valve_pulse_open(uint8_t channel)
     }
 }
 
-/**
- * @brief Pulse one valve channel in the close direction.
- *
- * Hardware note:
- *   The latching solenoid polarity is reversed from the original firmware
- *   assumption. CLOSE is INA high / INB low.
- *
- * @param channel Valve channel number, 1 or 2.
- */
 static void valve_pulse_close(uint8_t channel)
 {
+    valve_driver_off(channel);
+
     if (channel == 1u) {
         VNH1_PORT |= (1u << VNH1_INA_BIT);
         VNH1_PORT &= (uint8_t)~(1u << VNH1_INB_BIT);
@@ -590,9 +758,7 @@ static void valve_pulse_close(uint8_t channel)
     }
 
     led_on();
-    for (uint8_t i = 0u; i < VALVE_PULSE_MS; i++) {
-        _delay_ms(1);
-    }
+    delay_ms_safe(VALVE_PULSE_MS);
     led_off();
 
     valve_driver_off(channel);
@@ -607,7 +773,7 @@ static void valve_pulse_close(uint8_t channel)
 static void valve_close_all(void)
 {
     valve_pulse_close(1u);
-    _delay_ms(20);
+    delay_ms_safe(20u);
     valve_pulse_close(2u);
 }
 
@@ -615,9 +781,6 @@ static void valve_close_all(void)
  * CONFIG MODE CONTROL
  * ========================================================================== */
 
-/**
- * @brief Enter config mode.
- */
 static void enter_config_mode(void)
 {
     g_config_mode = true;
@@ -627,9 +790,6 @@ static void enter_config_mode(void)
     led_off();
 }
 
-/**
- * @brief Exit config mode.
- */
 static void exit_config_mode(void)
 {
     g_config_mode = false;
@@ -639,9 +799,6 @@ static void exit_config_mode(void)
     led_off();
 }
 
-/**
- * @brief Service config mode timeout and LED blink.
- */
 static void config_mode_poll(void)
 {
     if (!g_config_mode) {
@@ -668,15 +825,6 @@ static void config_mode_poll(void)
     }
 }
 
-/**
- * @brief Check boot-time config button hold and optionally enter config mode.
- *
- * This check runs immediately after basic initialization and before the normal
- * startup blink / boot banner path. The button is only honored during boot.
- * It must remain continuously held for the full hold interval. Any release
- * aborts the request.
- */
-
 static void check_config_button_at_boot(void)
 {
     uint16_t held_ms = 0u;
@@ -686,11 +834,13 @@ static void check_config_button_at_boot(void)
     }
 
     while (held_ms < CONFIG_BOOT_HOLD_MS) {
+        wdt_reset();
+
         if (!config_button_pressed()) {
             return;
         }
 
-        _delay_ms(CONFIG_BOOT_SAMPLE_MS);
+        delay_ms_safe(CONFIG_BOOT_SAMPLE_MS);
         held_ms += CONFIG_BOOT_SAMPLE_MS;
     }
 
@@ -701,12 +851,6 @@ static void check_config_button_at_boot(void)
  * PROTOCOL UTILITIES
  * ========================================================================== */
 
-/**
- * @brief Convert a nibble to uppercase hex.
- *
- * @param v Value whose low nibble is converted.
- * @return ASCII hex character.
- */
 static char nibble_to_hex(uint8_t v)
 {
     v &= 0x0Fu;
@@ -716,14 +860,6 @@ static char nibble_to_hex(uint8_t v)
     return (char)('A' + (v - 10u));
 }
 
-/**
- * @brief Convert one ASCII hex digit to a nibble.
- *
- * @param c Input ASCII character.
- * @param[out] out Parsed nibble.
- * @retval true  Character was valid hex.
- * @retval false Character was not valid hex.
- */
 static bool hex_char_to_nibble(char c, uint8_t *out)
 {
     if ((c >= '0') && (c <= '9')) {
@@ -741,15 +877,6 @@ static bool hex_char_to_nibble(char c, uint8_t *out)
     return false;
 }
 
-/**
- * @brief Convert two ASCII hex digits into one byte.
- *
- * @param hi_c High nibble ASCII character.
- * @param lo_c Low nibble ASCII character.
- * @param[out] out Parsed byte.
- * @retval true  Pair was valid.
- * @retval false Pair was invalid.
- */
 static bool hex_pair_to_u8(char hi_c, char lo_c, uint8_t *out)
 {
     uint8_t hi;
@@ -766,13 +893,6 @@ static bool hex_pair_to_u8(char hi_c, char lo_c, uint8_t *out)
     return true;
 }
 
-/**
- * @brief Compute protocol checksum over the body bytes.
- *
- * @param body Pointer to body bytes.
- * @param body_len_without_checksum Number of body bytes to sum.
- * @return 8-bit checksum.
- */
 static uint8_t ascii_sum_checksum(const char *body, uint8_t body_len_without_checksum)
 {
     uint16_t sum = 0u;
@@ -784,15 +904,6 @@ static uint8_t ascii_sum_checksum(const char *body, uint8_t body_len_without_che
     return (uint8_t)(sum & 0xFFu);
 }
 
-/**
- * @brief Check whether a normal command address matches this node.
- *
- * Unassigned node 00 does not answer directed normal commands.
- *
- * @param addr Destination address from the frame.
- * @retval true  Address matches this node or broadcast.
- * @retval false Address does not match.
- */
 static bool node_addr_matches(uint8_t addr)
 {
     if (g_node_addr == NODE_INVALID_ADDR) {
@@ -802,16 +913,6 @@ static bool node_addr_matches(uint8_t addr)
     return (addr == g_node_addr) || (addr == NODE_BROADCAST_ADDR);
 }
 
-/**
- * @brief Check whether an address matches config-entry rules.
- *
- * Config-entry is allowed by current assigned address, or by 00 if the node
- * is currently unassigned.
- *
- * @param addr Destination address from the frame.
- * @retval true  Address is accepted for config entry.
- * @retval false Address is rejected.
- */
 static bool config_entry_addr_matches(uint8_t addr)
 {
     if (addr == g_node_addr) {
@@ -825,17 +926,6 @@ static bool config_entry_addr_matches(uint8_t addr)
     return false;
 }
 
-/**
- * @brief Send a generic reply frame.
- *
- * Frame format:
- *   :DDC[A][B]KK\r\n
- *
- * @param addr Reply source address.
- * @param reply_cmd Reply command character.
- * @param arg0 Optional first reply argument, or 0.
- * @param arg1 Optional second reply argument, or 0.
- */
 static void send_reply(uint8_t addr, char reply_cmd, char arg0, char arg1)
 {
     char body[8];
@@ -870,19 +960,6 @@ static void send_reply(uint8_t addr, char reply_cmd, char arg0, char arg1)
     uart_write(frame);
 }
 
-/**
- * @brief Send boot banner if node is assigned.
- */
-// static void send_boot_banner(void)
-// {
-//     if (g_node_addr != NODE_INVALID_ADDR) {
-//         send_reply(g_node_addr, 'B', 0, 0);
-//     }
-// }
-
-/**
- * @brief Send firmware version reply.
- */
 static void send_version_reply(void)
 {
     char body[10];
@@ -914,63 +991,29 @@ static void send_version_reply(void)
     uart_write(frame);
 }
 
-/**
- * @brief Block for the specified number of milliseconds.
- *
- * @param ms Delay time in milliseconds.
- */
 static void delay_ms_block(uint16_t ms)
 {
-    while (ms--) {
-        _delay_ms(1);
-    }
+    delay_ms_safe(ms);
 }
 
-/**
- * @brief Emit a short startup blink pattern.
- */
 static void startup_blink(void)
 {
     for (uint8_t i = 0; i < 3u; i++) {
         led_on();
-        delay_ms_block(120);
+        delay_ms_block(120u);
         led_off();
-        delay_ms_block(120);
+        delay_ms_block(120u);
     }
-}
-
-/**
- * @brief Validate a new address for assignment.
- *
- * @param addr Candidate node address.
- * @retval true  Address is valid assignable address.
- * @retval false Address is invalid or broadcast.
- */
-static bool valid_assign_addr(uint8_t addr)
-{
-    return (addr != NODE_INVALID_ADDR) && (addr != NODE_BROADCAST_ADDR);
 }
 
 /* ============================================================================
  * RECEIVE PARSER AND COMMAND EXECUTION
  * ========================================================================== */
 
-/** @brief Receive body buffer. */
 static char g_rx_body[RX_BODY_MAX_CHARS + 1];
-
-/** @brief Current received body length. */
 static uint8_t g_rx_len = 0u;
-
-/** @brief True while accumulating a frame body. */
 static bool g_rx_active = false;
 
-/**
- * @brief Execute one parsed command.
- *
- * @param addr Destination address extracted from frame.
- * @param cmd Command character.
- * @param arg Optional command argument, or 0.
- */
 static void handle_command(uint8_t addr, char cmd, char arg)
 {
     bool handled = false;
@@ -989,8 +1032,19 @@ static void handle_command(uint8_t addr, char cmd, char arg)
             return;
         }
 
-        save_node_addr(addr);
+        if (!save_node_addr(addr)) {
+            g_addr_fault = true;
+            g_addr_load_status = ADDR_LOAD_CORRUPT;
+            send_reply(g_node_addr, 'E', 0, 0);
+            return;
+        }
+
+        g_addr_fault = false;
+        g_addr_fault_blink_ms = 0u;
+        g_addr_fault_led_on = false;
+        g_addr_load_status = ADDR_LOAD_VALID;
         g_node_addr = addr;
+
         send_reply(g_node_addr, 'A', 0, 0);
         handled = true;
         break;
@@ -1050,7 +1104,6 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
             send_reply(g_node_addr, 'A', 0, 0);
             led_flash_short();
-
             handled = true;
             break;
 
@@ -1073,43 +1126,38 @@ static void handle_command(uint8_t addr, char cmd, char arg)
             }
             break;
 
-            case 'C':
-            case 'c':
-                if (addr == NODE_BROADCAST_ADDR) {
-                    if (g_node_addr == NODE_INVALID_ADDR) {
-                        return;
-                    }
-
-                    if (arg != 0) {
-                        return;
-                    }
-
-                    for (uint8_t i = 0u; i < g_node_addr; i++) {
-                        _delay_ms(WHO_SLOT_MS);
-                    }
-
-                    valve_close_all();
-
-                    /*
-                     * No reply to broadcast close-all.
-                     * Avoid reply collisions.
-                     */
-                    handled = true;
-                    break;
+        case 'C':
+        case 'c':
+            if (addr == NODE_BROADCAST_ADDR) {
+                if (g_node_addr == NODE_INVALID_ADDR) {
+                    return;
                 }
 
-                if (arg == '1') {
-                    valve_pulse_close(1u);
-                    send_reply(g_node_addr, 'A', 0, 0);
-                    handled = true;
-                } else if (arg == '2') {
-                    valve_pulse_close(2u);
-                    send_reply(g_node_addr, 'A', 0, 0);
-                    handled = true;
-                } else {
-                    send_reply(g_node_addr, 'E', 0, 0);
+                if (arg != 0) {
+                    return;
                 }
+
+                for (uint8_t i = 0u; i < g_node_addr; i++) {
+                    delay_ms_safe(WHO_SLOT_MS);
+                }
+
+                valve_close_all();
+                handled = true;
                 break;
+            }
+
+            if (arg == '1') {
+                valve_pulse_close(1u);
+                send_reply(g_node_addr, 'A', 0, 0);
+                handled = true;
+            } else if (arg == '2') {
+                valve_pulse_close(2u);
+                send_reply(g_node_addr, 'A', 0, 0);
+                handled = true;
+            } else {
+                send_reply(g_node_addr, 'E', 0, 0);
+            }
+            break;
 
         case 'S':
         case 's':
@@ -1145,7 +1193,7 @@ static void handle_command(uint8_t addr, char cmd, char arg)
             }
 
             for (uint8_t i = 0u; i < g_node_addr; i++) {
-                _delay_ms(WHO_SLOT_MS);
+                delay_ms_safe(WHO_SLOT_MS);
             }
 
             send_reply(g_node_addr, 'W', 0, 0);
@@ -1176,12 +1224,6 @@ static void handle_command(uint8_t addr, char cmd, char arg)
     }
 }
 
-/**
- * @brief Process one complete received frame body.
- *
- * @param body Frame body without ':' and EOL.
- * @param len Length of the frame body.
- */
 static void process_body(char *body, uint8_t len)
 {
     uint8_t addr;
@@ -1221,9 +1263,6 @@ static void process_body(char *body, uint8_t len)
     handle_command(addr, cmd, arg);
 }
 
-/**
- * @brief Poll UART and assemble complete line-oriented frames.
- */
 static void serial_poll(void)
 {
     char c;
@@ -1267,11 +1306,6 @@ static void serial_poll(void)
  * MAIN
  * ========================================================================== */
 
-/**
- * @brief Firmware entry point.
- *
- * @return Never returns.
- */
 int main(void)
 {
     gpio_init();
@@ -1280,26 +1314,30 @@ int main(void)
     valve_driver_off(1u);
     valve_driver_off(2u);
 
-    g_node_addr = load_node_addr();
+    watchdog_init();
 
-    _delay_ms(20);
+    g_node_addr = load_node_addr(&g_addr_load_status);
+    g_addr_fault = (g_addr_load_status == ADDR_LOAD_CORRUPT);
 
-    /* Check config button first so hold timing starts immediately at boot. */
+    delay_ms_safe(20u);
+
     check_config_button_at_boot();
 
     startup_blink();
 
-   // send_boot_banner();
-
     for (;;) {
+        wdt_reset();
+
         serial_poll();
 
-        if (g_config_mode) {
+        if (g_addr_fault) {
+            address_fault_blink_poll();
+        } else if (g_config_mode) {
             config_mode_poll();
         } else {
             identify_mode_poll();
         }
 
-        _delay_ms(POLL_TICK_MS);
+        delay_ms_safe(POLL_TICK_MS);
     }
 }

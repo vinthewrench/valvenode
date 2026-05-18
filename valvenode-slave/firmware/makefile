@@ -8,7 +8,7 @@
 # Project Configuration
 # ------------------------------------------------------------
 
-FW_VERSION_BCD := 0x0102
+FW_VERSION_BCD := 0x0106
 
 PROJECT := valvenode
 MCU     := attiny4313
@@ -132,6 +132,15 @@ isp:
 	$(AVRDUDE) -c $(PROGRAMMER) -P $(PORT) -p $(AVRDUDE_MCU) \
 		-B 100 \
 		-v
+
+read-eeprom:
+			avrdude -c atmelice_isp -P usb -p t4313 \
+				-U eeprom:r:eeprom.bin:r
+			hexdump -C eeprom.bin | head
+
+write-eeprom-blank:
+			avrdude -c atmelice_isp -P usb -p t4313 \
+				-U eeprom:w:blank_eeprom.bin:r
 
 
 # ------------------------------------------------------------
