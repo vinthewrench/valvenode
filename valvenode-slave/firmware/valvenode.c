@@ -29,8 +29,8 @@
  *
  * Addressing:
  *   - 01..FE valid node addresses
- *   - FF     broadcast
- *   - 00     invalid / unassigned
+ *   - FF     broadcast address
+ *   - 00     invalid / unassigned address
  *
  * Supported requests:
  *   - :04P   ping node 04
@@ -41,13 +41,26 @@
  *   - :04S1  status valve 1 on node 04
  *   - :04S2  status valve 2 on node 04
  *   - :04V   get firmware version from node 04
- *   - :04I   enable identify mode on node 04
+ *   - :04I   enable identify/blink mode on node 04
  *   - :04M   put node 04 into config mode
  *   - :00M   put an unassigned node into config mode
  *   - :DDN   assign new address DD while node is in config mode
- *   - :FFW   broadcast who
+ *   - :FFW   broadcast WHO discovery
  *   - :FFC   broadcast close all local valves
  *   - :FFX   broadcast cancel config / identify mode
+ *
+ * Command letters:
+ *   - P  ping, directed only, replies ACK
+ *   - O  open local valve channel, directed only, arg = valve number
+ *   - C  close local valve channel, directed, arg = valve number
+ *   - C  broadcast close-all when sent as :FFC with no valve argument
+ *   - S  status query, directed only, arg = valve number
+ *   - V  firmware version query, directed only
+ *   - I  identify mode, directed only
+ *   - M  config mode entry, directed to current node or address 00
+ *   - N  new address assignment while already in config mode
+ *   - W  WHO discovery, broadcast only
+ *   - X  cancel config / identify mode, broadcast only
  *
  * Example replies:
  *   - :04AKK       ACK from node 04
@@ -79,6 +92,11 @@
  *   - Valve pulse width is 20 ms
  *   - Production valve output uses a 2.2 ohm series resistor
  *   - Watchdog is enabled to recover from firmware hangs during valve pulses
+ *
+ * Important limitation:
+ *   The stored valve state is the last commanded state. This firmware does not
+ *   sense actual valve position, water flow, or whether a solenoid is physically
+ *   connected.
  */
 
 #define F_CPU 8000000UL
@@ -146,7 +164,7 @@
 /** @brief Config mode timeout in milliseconds. */
 #define CONFIG_MODE_TIMEOUT_MS         30000u
 
-/** @brief Config mode LED half-period, 1 s on and 1 s off. */
+/** @brief Config mode LED half-period, 1 second on and 1 second off. */
 #define CONFIG_BLINK_HALF_MS           1000u
 
 /** @brief Address-fault LED half-period in milliseconds. */
@@ -225,6 +243,9 @@
 
 /**
  * @brief Logical valve state tracked by firmware.
+ *
+ * This is command-state only. It is updated after a successful local pulse.
+ * It does not prove physical valve position.
  */
 typedef enum
 {
@@ -310,6 +331,9 @@ static node_identity_t EEMEM ee_node_identity;
 /**
  * @brief Validate a new address for assignment.
  *
+ * Valid assigned addresses are 01..FE. Address 00 is reserved for unassigned
+ * nodes and FF is reserved for broadcast.
+ *
  * @param addr Candidate node address.
  * @retval true  Address is valid assignable address.
  * @retval false Address is invalid or broadcast.
@@ -370,6 +394,9 @@ static uint8_t load_node_addr(addr_load_status_t *status)
 /**
  * @brief Persist node address to EEPROM and verify it.
  *
+ * EEPROM is written as a small identity record containing magic, address, and
+ * inverse-address. The inverse byte catches common EEPROM corruption cases.
+ *
  * @param addr New node address to store.
  * @return true if EEPROM verified after write.
  */
@@ -424,6 +451,9 @@ static void watchdog_init(void)
 /**
  * @brief Delay in milliseconds while servicing the watchdog.
  *
+ * Use this instead of long raw _delay_ms() loops when outputs may be active or
+ * when waiting inside protocol handling.
+ *
  * @param ms Delay time in milliseconds.
  */
 static void delay_ms_safe(uint16_t ms)
@@ -440,6 +470,8 @@ static void delay_ms_safe(uint16_t ms)
 
 /**
  * @brief Put the RS-485 transceiver into receive mode.
+ *
+ * DE and /RE are tied together, so low means receive.
  */
 static inline void rs485_set_rx(void)
 {
@@ -448,6 +480,8 @@ static inline void rs485_set_rx(void)
 
 /**
  * @brief Put the RS-485 transceiver into transmit mode.
+ *
+ * DE and /RE are tied together, so high means transmit.
  */
 static inline void rs485_set_tx(void)
 {
@@ -456,6 +490,9 @@ static inline void rs485_set_tx(void)
 
 /**
  * @brief Wait the programmed RX-to-TX turnaround delay.
+ *
+ * This gives the RS-485 transceiver and bus a short settle time before this
+ * node drives the line.
  */
 static void rs485_wait_rx_to_tx_turnaround(void)
 {
@@ -494,8 +531,11 @@ static void uart_putc(char c)
 /**
  * @brief Read one character from UART if available.
  *
+ * UART framing, overrun, and parity errors are consumed and reported as no
+ * usable character. The byte is still read from UDR to clear the UART state.
+ *
  * @param[out] out Pointer receiving the character.
- * @return true if a character was available, false otherwise.
+ * @return true if a valid character was available, false otherwise.
  */
 static bool uart_getc_nonblocking(char *out)
 {
@@ -595,6 +635,9 @@ static void led_flash_short(void)
 
 /**
  * @brief Enter identify mode.
+ *
+ * Identify mode blinks the status LED at a faster rate than config mode so the
+ * physical node can be found in the field.
  */
 static void enter_identify_mode(void)
 {
@@ -618,7 +661,8 @@ static void exit_identify_mode(void)
 /**
  * @brief Service address-fault LED blinking.
  *
- * This is intentionally much faster than normal config blink.
+ * This is intentionally much faster than normal config blink. Address-fault
+ * means EEPROM identity is corrupt and should not be silently trusted.
  */
 static void address_fault_blink_poll(void)
 {
@@ -663,6 +707,10 @@ static void identify_mode_poll(void)
 
 /**
  * @brief Initialize GPIO directions and safe idle states.
+ *
+ * All VNH driver inputs and PWM/enable pins are driven inactive before their
+ * DDR bits are enabled as outputs. That avoids accidental solenoid pulses at
+ * boot.
  */
 static void gpio_init(void)
 {
@@ -699,6 +747,19 @@ static void gpio_init(void)
  * VALVE DRIVER CONTROL
  * ========================================================================== */
 
+/**
+ * @brief Disable all drive outputs for one valve channel.
+ *
+ * This is the safe idle state for the VNH driver:
+ *   - PWM / enable low
+ *   - INA low
+ *   - INB low
+ *
+ * Call this before changing direction and after every pulse. The latching
+ * solenoids only need a short polarity pulse, not continuous drive.
+ *
+ * @param channel Valve channel number, currently 1 or 2.
+ */
 static void valve_driver_off(uint8_t channel)
 {
     if (channel == 1u) {
@@ -712,6 +773,21 @@ static void valve_driver_off(uint8_t channel)
     }
 }
 
+/**
+ * @brief Pulse one latching solenoid in the OPEN direction.
+ *
+ * The VNH driver direction pins are set first, then the PWM/enable input is
+ * asserted after a short setup delay. The output remains energized only for
+ * VALVE_PULSE_MS, then the driver is returned to its safe off state.
+ *
+ * Channel polarity:
+ *   valve 1 open: INA=0, INB=1
+ *   valve 2 open: INA=0, INB=1
+ *
+ * The firmware records the last commanded state. This is not physical feedback.
+ *
+ * @param channel Valve channel number, currently 1 or 2.
+ */
 static void valve_pulse_open(uint8_t channel)
 {
     valve_driver_off(channel);
@@ -741,6 +817,21 @@ static void valve_pulse_open(uint8_t channel)
     }
 }
 
+/**
+ * @brief Pulse one latching solenoid in the CLOSE direction.
+ *
+ * This is the reverse-polarity companion to valve_pulse_open(). The driver is
+ * pre-cleared, direction is set, PWM/enable is asserted briefly, and then all
+ * outputs are turned off again.
+ *
+ * Channel polarity:
+ *   valve 1 close: INA=1, INB=0
+ *   valve 2 close: INA=1, INB=0
+ *
+ * The stored valve state is the last commanded state only.
+ *
+ * @param channel Valve channel number, currently 1 or 2.
+ */
 static void valve_pulse_close(uint8_t channel)
 {
     valve_driver_off(channel);
@@ -770,6 +861,16 @@ static void valve_pulse_close(uint8_t channel)
     }
 }
 
+/**
+ * @brief Close every local valve channel on this node.
+ *
+ * This is used by the broadcast close-all command, :FFC. The Valve Master sends
+ * the broadcast once, and each node closes its own local outputs.
+ *
+ * A short delay is inserted between valve pulses so both VNH drivers and the
+ * supply wiring are not hit with back-to-back transients at exactly the same
+ * instant.
+ */
 static void valve_close_all(void)
 {
     valve_pulse_close(1u);
@@ -781,6 +882,12 @@ static void valve_close_all(void)
  * CONFIG MODE CONTROL
  * ========================================================================== */
 
+/**
+ * @brief Enter address/configuration mode.
+ *
+ * In config mode, the node accepts address-assignment commands. This mode can
+ * be entered either by command or by holding the config button during boot.
+ */
 static void enter_config_mode(void)
 {
     g_config_mode = true;
@@ -790,6 +897,9 @@ static void enter_config_mode(void)
     led_off();
 }
 
+/**
+ * @brief Exit address/configuration mode and restore normal LED state.
+ */
 static void exit_config_mode(void)
 {
     g_config_mode = false;
@@ -799,6 +909,12 @@ static void exit_config_mode(void)
     led_off();
 }
 
+/**
+ * @brief Service config-mode timeout and LED blink.
+ *
+ * This function is called from the main loop at POLL_TICK_MS cadence. While in
+ * config mode, the LED blinks slowly and the timeout counter advances.
+ */
 static void config_mode_poll(void)
 {
     if (!g_config_mode) {
@@ -825,6 +941,13 @@ static void config_mode_poll(void)
     }
 }
 
+/**
+ * @brief Check whether the config button is held during boot.
+ *
+ * Holding the config button for CONFIG_BOOT_HOLD_MS enters config mode without
+ * needing a valid node address. This is the physical recovery path for a blank,
+ * unassigned, or incorrectly addressed node.
+ */
 static void check_config_button_at_boot(void)
 {
     uint16_t held_ms = 0u;
@@ -851,6 +974,9 @@ static void check_config_button_at_boot(void)
  * PROTOCOL UTILITIES
  * ========================================================================== */
 
+/**
+ * @brief Convert a 4-bit value to uppercase ASCII hex.
+ */
 static char nibble_to_hex(uint8_t v)
 {
     v &= 0x0Fu;
@@ -860,6 +986,9 @@ static char nibble_to_hex(uint8_t v)
     return (char)('A' + (v - 10u));
 }
 
+/**
+ * @brief Convert one ASCII hex character to a 4-bit value.
+ */
 static bool hex_char_to_nibble(char c, uint8_t *out)
 {
     if ((c >= '0') && (c <= '9')) {
@@ -877,6 +1006,9 @@ static bool hex_char_to_nibble(char c, uint8_t *out)
     return false;
 }
 
+/**
+ * @brief Convert two ASCII hex characters into one byte.
+ */
 static bool hex_pair_to_u8(char hi_c, char lo_c, uint8_t *out)
 {
     uint8_t hi;
@@ -893,6 +1025,12 @@ static bool hex_pair_to_u8(char hi_c, char lo_c, uint8_t *out)
     return true;
 }
 
+/**
+ * @brief Compute protocol checksum over ASCII body bytes.
+ *
+ * The checksum is the low 8 bits of the sum of the body characters. The leading
+ * ':' and trailing CR/LF are not included.
+ */
 static uint8_t ascii_sum_checksum(const char *body, uint8_t body_len_without_checksum)
 {
     uint16_t sum = 0u;
@@ -904,6 +1042,13 @@ static uint8_t ascii_sum_checksum(const char *body, uint8_t body_len_without_che
     return (uint8_t)(sum & 0xFFu);
 }
 
+/**
+ * @brief Check whether a received address should be accepted by this node.
+ *
+ * Assigned nodes accept their own address and broadcast. Unassigned nodes only
+ * accept broadcast here. Config entry for address 00 is handled separately by
+ * config_entry_addr_matches().
+ */
 static bool node_addr_matches(uint8_t addr)
 {
     if (g_node_addr == NODE_INVALID_ADDR) {
@@ -913,6 +1058,13 @@ static bool node_addr_matches(uint8_t addr)
     return (addr == g_node_addr) || (addr == NODE_BROADCAST_ADDR);
 }
 
+/**
+ * @brief Check whether a received M/config command may enter config mode.
+ *
+ * This allows:
+ *   - an assigned node to enter config mode using its current address
+ *   - an unassigned node to enter config mode using address 00
+ */
 static bool config_entry_addr_matches(uint8_t addr)
 {
     if (addr == g_node_addr) {
@@ -926,6 +1078,17 @@ static bool config_entry_addr_matches(uint8_t addr)
     return false;
 }
 
+/**
+ * @brief Send a normal reply frame with optional one or two arguments.
+ *
+ * Replies always include checksum.
+ *
+ * Reply body examples before checksum:
+ *   - 04A    ACK from node 04
+ *   - 04E    error from node 04
+ *   - 04W    WHO response from node 04
+ *   - 04R1O  valve 1 open
+ */
 static void send_reply(uint8_t addr, char reply_cmd, char arg0, char arg1)
 {
     char body[8];
@@ -960,6 +1123,14 @@ static void send_reply(uint8_t addr, char reply_cmd, char arg0, char arg1)
     uart_write(frame);
 }
 
+/**
+ * @brief Send firmware version reply.
+ *
+ * Version reply format:
+ *   :DDVvvvvKK
+ *
+ * vvvv is FW_VERSION as four ASCII hex digits.
+ */
 static void send_version_reply(void)
 {
     char body[10];
@@ -991,11 +1162,17 @@ static void send_version_reply(void)
     uart_write(frame);
 }
 
+/**
+ * @brief Compatibility wrapper around watchdog-safe delay.
+ */
 static void delay_ms_block(uint16_t ms)
 {
     delay_ms_safe(ms);
 }
 
+/**
+ * @brief Blink LED three times during startup.
+ */
 static void startup_blink(void)
 {
     for (uint8_t i = 0; i < 3u; i++) {
@@ -1010,10 +1187,69 @@ static void startup_blink(void)
  * RECEIVE PARSER AND COMMAND EXECUTION
  * ========================================================================== */
 
+/** @brief Receive body buffer, excluding ':' and EOL. */
 static char g_rx_body[RX_BODY_MAX_CHARS + 1];
+
+/** @brief Current receive body length. */
 static uint8_t g_rx_len = 0u;
+
+/** @brief True after ':' has started an incoming frame. */
 static bool g_rx_active = false;
 
+/**
+ * @brief Execute one decoded protocol command.
+ *
+ * Command summary:
+ *
+ *   N / n:
+ *     Assign a New node address while already in config mode.
+ *     The address used in the frame, DD, is the new address.
+ *     Example: :04N assigns address 04 to the node currently in config mode.
+ *
+ *   M / m:
+ *     Enter config Mode.
+ *     Directed to current address, or to 00 for an unassigned node.
+ *     Example: :04M puts node 04 into config mode.
+ *     Example: :00M puts an unassigned node into config mode.
+ *
+ *   X / x:
+ *     Broadcast cancel.
+ *     Only accepted as :FFX.
+ *     Exits config mode and/or identify mode.
+ *
+ *   I / i:
+ *     Identify.
+ *     Directed only. Starts fast LED blink so the physical node can be found.
+ *
+ *   P / p:
+ *     Ping.
+ *     Directed only. Replies ACK and flashes LED briefly.
+ *
+ *   O / o:
+ *     Open valve.
+ *     Directed only. Argument is valve channel: '1' or '2'.
+ *
+ *   C / c:
+ *     Close valve when directed with argument '1' or '2'.
+ *     Broadcast close-all when sent as :FFC with no argument.
+ *
+ *   S / s:
+ *     Status query.
+ *     Directed only. Argument is valve channel: '1' or '2'.
+ *     Replies R + channel + state.
+ *
+ *   W / w:
+ *     WHO discovery.
+ *     Broadcast only. Assigned nodes reply after address-based slot delay.
+ *
+ *   V / v:
+ *     Version query.
+ *     Directed only. Replies with packed FW_VERSION.
+ *
+ * @param addr Decoded destination address from frame.
+ * @param cmd Decoded command letter.
+ * @param arg Optional command argument, or 0 if no argument was supplied.
+ */
 static void handle_command(uint8_t addr, char cmd, char arg)
 {
     bool handled = false;
@@ -1023,6 +1259,13 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
     case 'N':
     case 'n':
+        /*
+         * N = New address assignment.
+         *
+         * Only valid while already in config mode. The target address in the
+         * frame is the new assigned address. This avoids needing a separate
+         * argument field for the new address.
+         */
         if (!g_config_mode) {
             return;
         }
@@ -1051,6 +1294,13 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
     case 'M':
     case 'm':
+        /*
+         * M = config Mode.
+         *
+         * Allows the node to accept N/new-address command. Assigned nodes enter
+         * config mode using their current address. Blank/unassigned nodes enter
+         * config mode using address 00.
+         */
         if (!config_entry_addr_matches(addr)) {
             return;
         }
@@ -1063,6 +1313,13 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
     case 'X':
     case 'x':
+        /*
+         * X = broadcast cancel.
+         *
+         * Only accepted as :FFX. Cancels config and identify modes. No reply is
+         * sent because this is a broadcast command and multiple nodes may hear
+         * it at the same time.
+         */
         if (addr != NODE_BROADCAST_ADDR) {
             return;
         }
@@ -1079,6 +1336,9 @@ static void handle_command(uint8_t addr, char cmd, char arg)
         break;
 
     default:
+        /*
+         * Everything below must be addressed to this node or broadcast.
+         */
         if (!node_addr_matches(addr)) {
             return;
         }
@@ -1087,6 +1347,12 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'I':
         case 'i':
+            /*
+             * I = Identify.
+             *
+             * Directed only. Starts visible LED blink on this physical node.
+             * Broadcast identify is ignored to avoid every node blinking.
+             */
             if (addr == NODE_BROADCAST_ADDR) {
                 return;
             }
@@ -1098,6 +1364,12 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'P':
         case 'p':
+            /*
+             * P = Ping.
+             *
+             * Directed only. Replies ACK and flashes the LED briefly. Broadcast
+             * ping is ignored to avoid multiple simultaneous replies.
+             */
             if (addr == NODE_BROADCAST_ADDR) {
                 return;
             }
@@ -1109,6 +1381,13 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'O':
         case 'o':
+            /*
+             * O = Open valve.
+             *
+             * Directed only. Argument selects local valve channel:
+             *   '1' = valve 1
+             *   '2' = valve 2
+             */
             if (addr == NODE_BROADCAST_ADDR) {
                 return;
             }
@@ -1128,6 +1407,18 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'C':
         case 'c':
+            /*
+             * C = Close.
+             *
+             * Directed form:
+             *   :04C1 closes valve 1 on node 04
+             *   :04C2 closes valve 2 on node 04
+             *
+             * Broadcast form:
+             *   :FFC closes all local valves on every assigned node.
+             *
+             * Broadcast close-all intentionally sends no replies.
+             */
             if (addr == NODE_BROADCAST_ADDR) {
                 if (g_node_addr == NODE_INVALID_ADDR) {
                     return;
@@ -1161,6 +1452,13 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'S':
         case 's':
+            /*
+             * S = Status.
+             *
+             * Directed only. Argument selects valve channel. Reply command is R:
+             *   :04R1O... valve 1 last commanded open
+             *   :04R1C... valve 1 last commanded closed
+             */
             if (addr == NODE_BROADCAST_ADDR) {
                 return;
             }
@@ -1184,6 +1482,13 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'W':
         case 'w':
+            /*
+             * W = WHO discovery.
+             *
+             * Broadcast only. Assigned nodes reply after a slot delay based on
+             * their node address. This reduces reply collisions on the RS-485
+             * bus when many nodes hear :FFW at the same time.
+             */
             if (addr != NODE_BROADCAST_ADDR) {
                 return;
             }
@@ -1202,6 +1507,11 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 
         case 'V':
         case 'v':
+            /*
+             * V = firmware Version.
+             *
+             * Directed only. Replies with FW_VERSION as four ASCII hex digits.
+             */
             if (addr == NODE_BROADCAST_ADDR) {
                 return;
             }
@@ -1211,6 +1521,10 @@ static void handle_command(uint8_t addr, char cmd, char arg)
             break;
 
         default:
+            /*
+             * Unknown directed commands receive error. Unknown broadcast
+             * commands are ignored because many nodes may hear them.
+             */
             if (addr != NODE_BROADCAST_ADDR) {
                 send_reply(g_node_addr, 'E', 0, 0);
             }
@@ -1219,11 +1533,29 @@ static void handle_command(uint8_t addr, char cmd, char arg)
         break;
     }
 
+    /*
+     * Most successful commands leave config mode. M itself is the exception:
+     * entering config mode should obviously remain in config mode.
+     */
     if (handled && g_config_mode && !stay_in_config) {
         exit_config_mode();
     }
 }
 
+/**
+ * @brief Parse and validate a completed frame body.
+ *
+ * The body excludes ':' and CR/LF. Accepted request body lengths:
+ *   - 3 bytes: DD + command
+ *   - 4 bytes: DD + command + arg
+ *   - 5 bytes: DD + command + checksum
+ *   - 6 bytes: DD + command + arg + checksum
+ *
+ * Checksums on requests are optional. If supplied, they must match.
+ *
+ * @param body Frame body buffer.
+ * @param len Body length.
+ */
 static void process_body(char *body, uint8_t len)
 {
     uint8_t addr;
@@ -1263,6 +1595,15 @@ static void process_body(char *body, uint8_t len)
     handle_command(addr, cmd, arg);
 }
 
+/**
+ * @brief Service the UART receive stream and assemble protocol frames.
+ *
+ * The parser is deliberately small:
+ *   - ':' starts a frame
+ *   - CR or LF ends a frame
+ *   - another ':' restarts the current frame
+ *   - overlength frames are discarded
+ */
 static void serial_poll(void)
 {
     char c;
@@ -1306,6 +1647,19 @@ static void serial_poll(void)
  * MAIN
  * ========================================================================== */
 
+/**
+ * @brief Firmware entry point.
+ *
+ * Startup order matters:
+ *   1. GPIO safe states
+ *   2. UART / RS-485 receive mode
+ *   3. valve drivers explicitly off
+ *   4. watchdog enabled
+ *   5. EEPROM address loaded
+ *   6. optional boot-button config mode
+ *   7. startup blink
+ *   8. command loop
+ */
 int main(void)
 {
     gpio_init();
