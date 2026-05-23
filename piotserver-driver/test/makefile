@@ -1,12 +1,13 @@
 CC        := clang
 CXX       := clang++
 
-ROOT_DIR  := ..
-SRC_DIR   := $(ROOT_DIR)/src
-BUILD_DIR := $(ROOT_DIR)/build/test
-TARGET    := $(ROOT_DIR)/build/plugin_harness
+ROOT_DIR   := ..
+SRC_DIR    := $(ROOT_DIR)/src
+DRIVER_DIR := $(ROOT_DIR)/drivers/VALVEMASTER
+BUILD_DIR  := $(ROOT_DIR)/build/test
+TARGET     := $(ROOT_DIR)/build/plugin_harness
 
-CPPFLAGS  := -isystem $(SRC_DIR)
+CPPFLAGS  := -isystem $(SRC_DIR) -I$(DRIVER_DIR)
 CXXFLAGS  := -std=gnu++23 -Wall -Wextra -Wpedantic -O2 -g
 LDFLAGS   :=
 LDLIBS    :=
@@ -33,7 +34,7 @@ dirs:
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(BUILD_DIR)/plugin_harness.o: plugin_harness.cpp
+$(BUILD_DIR)/plugin_harness.o: plugin_harness.cpp $(DRIVER_DIR)/VALVEMASTER_Device.hpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/LogMgr.o: $(SRC_DIR)/LogMgr.cpp $(SRC_DIR)/LogMgr.hpp

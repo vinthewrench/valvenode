@@ -211,9 +211,11 @@ write-eeprom-blank:
 # Internal 8 MHz RC, CKDIV8 disabled
 # Verify before writing on your actual hardware
 # ------------------------------------------------------------
+#
+# HFUSE := 0xDB  brown out at ~2.7 V dont mess with RSTDISBL
 
 LFUSE := 0xE4
-HFUSE := 0xDF
+HFUSE := 0xDB
 EFUSE := 0xFF
 
 set-fuses:

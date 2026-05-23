@@ -1,5 +1,5 @@
-CC  ?= cc
-CXX ?= c++
+CC  := clang
+CXX := clang++
 
 PLUGIN_NAME := VALVEMASTER
 VALVEMASTER_DRIVER_VERSION ?= 1.0

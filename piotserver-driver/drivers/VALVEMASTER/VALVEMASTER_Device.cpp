@@ -1,18 +1,22 @@
 #include "VALVEMASTER_Device.hpp"
 
 #include "LogMgr.hpp"
+#include "Utils.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <thread>
 
 using namespace std;
 
-/* ============================================================================
- * Valve Master I2C register map
- * ============================================================================
+
+// MARK: - Valve Master I2C Register Map
+
+/**
+ * @section valvemaster_i2c_register_map Valve Master I2C Register Map
  *
  * These values must match the register map implemented by valvenode_master.c
  * running on the ATmega88PB Valve Master board.
@@ -38,13 +42,17 @@ static constexpr uint8_t REG_VERSION_HI   = 0x10;
 static constexpr uint8_t REG_VERSION_LO   = 0x11;
 static constexpr uint8_t REG_NODE_MAP     = 0x20;
 
-/* ============================================================================
- * Valve Master command values
- * ============================================================================
+
+// MARK: - Valve Master Command Values
+
+/**
+ * @section valvemaster_command_values Valve Master Command Values
  *
- * These command bytes are written to REG_COMMAND. The firmware executes the
- * command from its main loop, not inside the TWI ISR. The host must then poll
- * STATUS_BUSY and check REG_RESULT.
+ * These command bytes are written to REG_COMMAND.
+ *
+ * Command arguments must be written first. REG_COMMAND is written last.
+ * The firmware executes the command from its main loop, not inside the TWI ISR.
+ * The host then polls STATUS_BUSY and checks REG_RESULT.
  */
 
 static constexpr uint8_t CMD_POWER_ON         = 0x01;
@@ -55,14 +63,16 @@ static constexpr uint8_t CMD_SET_CHANNEL      = 0x05;
 static constexpr uint8_t CMD_GET_NODE_VERSION = 0x07;
 static constexpr uint8_t CMD_CLOSE_ALL        = 0x0F;
 
-/* ============================================================================
- * Status and result values
- * ============================================================================
+
+// MARK: - Valve Master Status and Result Values
+
+/**
+ * @section valvemaster_status_result_values Valve Master Status and Result Values
  *
- * STATUS_BUSY means the Valve Master is still executing a command. Do not issue
- * another command until it clears.
+ * STATUS_BUSY means the Valve Master is still executing a command. The host
+ * must not issue another command until STATUS_BUSY clears.
  *
- * STATUS_ERROR is tracked by firmware and mirrored in REG_RESULT.
+ * STATUS_ERROR is tracked by firmware and mirrored through REG_RESULT.
  *
  * STATUS_POWER_ON reflects the Valve Master's current belief about switched
  * field-bus power.
@@ -74,9 +84,11 @@ static constexpr uint8_t STATUS_POWER_ON      = (1u << 2);
 
 static constexpr uint8_t RESULT_OK            = 0x00;
 
-/* ============================================================================
- * Node map / timing constants
- * ============================================================================
+
+// MARK: - Node Map and Timing Constants
+
+/**
+ * @section valvemaster_node_map_timing Node Map and Timing Constants
  *
  * NODE_MAP_BYTES is the maximum number of node entries exposed by the Valve
  * Master firmware.
@@ -85,7 +97,7 @@ static constexpr uint8_t RESULT_OK            = 0x00;
  * The Valve Master firmware has its own RS-485 timeouts internally.
  */
 
-static constexpr uint8_t NODE_MAP_BYTES       = 32;
+static constexpr uint8_t NODE_MAP_BYTES           = 32;
 
 static constexpr uint32_t WHO_SCAN_TIMEOUT_MS     = 10000;
 static constexpr uint32_t PING_TIMEOUT_MS         = 2000;
@@ -93,50 +105,16 @@ static constexpr uint32_t VERSION_TIMEOUT_MS      = 2000;
 static constexpr uint32_t SET_CHANNEL_TIMEOUT_MS  = 3000;
 static constexpr uint32_t CLOSE_ALL_TIMEOUT_MS    = 3000;
 
-/* ============================================================================
- * Small parsing helpers
- * ========================================================================== */
 
-/**
- * @brief Parse common bool-like strings used by pIoTServer schemas.
- *
- * Accepted true values:
- *   1, true, on, yes
- *
- * Accepted false values:
- *   0, false, off, no
- *
- * @param value Input string.
- * @param[out] out Parsed boolean value.
- * @return true if the string was recognized.
- */
-static bool parse_bool_string(const string& value, bool& out)
-{
-    string s = value;
-
-    transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(tolower(c));
-    });
-
-    if(s == "1" || s == "true" || s == "on" || s == "yes") {
-        out = true;
-        return true;
-    }
-
-    if(s == "0" || s == "false" || s == "off" || s == "no") {
-        out = false;
-        return true;
-    }
-
-    return false;
-}
+// MARK: - Local Parsing and Formatting Helpers
 
 /**
  * @brief Parse an I2C 7-bit address from decimal or C-style hex text.
  *
  * Examples:
- *   "9"
- *   "0x09"
+ *
+ *   - "9"
+ *   - "0x09"
  *
  * @param text Address string.
  * @param[out] out Parsed 7-bit address.
@@ -144,16 +122,18 @@ static bool parse_bool_string(const string& value, bool& out)
  */
 static bool parse_u8_address(const string& text, uint8_t& out)
 {
-    if(text.empty()) {
+    string trimmed = Utils::trim(text);
+
+    if(trimmed.empty()) {
         return false;
     }
 
     char* end = nullptr;
     errno = 0;
 
-    unsigned long value = strtoul(text.c_str(), &end, 0);
+    unsigned long value = strtoul(trimmed.c_str(), &end, 0);
 
-    if(errno != 0 || end == text.c_str() || *end != '\0') {
+    if(errno != 0 || end == trimmed.c_str() || *end != '\0') {
         return false;
     }
 
@@ -176,16 +156,18 @@ static bool parse_u8_address(const string& text, uint8_t& out)
  */
 static bool parse_u8_value(const string& text, uint8_t& out)
 {
-    if(text.empty()) {
+    string trimmed = Utils::trim(text);
+
+    if(trimmed.empty()) {
         return false;
     }
 
     char* end = nullptr;
     errno = 0;
 
-    unsigned long value = strtoul(text.c_str(), &end, 0);
+    unsigned long value = strtoul(trimmed.c_str(), &end, 0);
 
-    if(errno != 0 || end == text.c_str() || *end != '\0') {
+    if(errno != 0 || end == trimmed.c_str() || *end != '\0') {
         return false;
     }
 
@@ -245,9 +227,63 @@ static bool json_get_u8(const json& j, const char* key, uint8_t& out)
 }
 
 /**
+ * @brief Extract an unsigned long from JSON.
+ *
+ * This accepts unsigned numbers, non-negative signed numbers, and strings such
+ * as "30" or "0x1e".
+ *
+ * @param j JSON value.
+ * @param[out] out Parsed unsigned long value.
+ * @return true if the value was valid.
+ */
+static bool json_value_to_unsigned_long(const json& j, unsigned long& out)
+{
+    if(j.is_number_unsigned()) {
+        out = j.get<unsigned long>();
+        return true;
+    }
+
+    if(j.is_number_integer()) {
+        long value = j.get<long>();
+
+        if(value < 0) {
+            return false;
+        }
+
+        out = static_cast<unsigned long>(value);
+        return true;
+    }
+
+    if(j.is_string()) {
+        string text = Utils::trim(j.get<string>());
+
+        if(text.empty()) {
+            return false;
+        }
+
+        char* end = nullptr;
+        errno = 0;
+
+        unsigned long value = strtoul(text.c_str(), &end, 0);
+
+        if(errno != 0 || end == text.c_str() || *end != '\0') {
+            return false;
+        }
+
+        out = value;
+        return true;
+    }
+
+    return false;
+}
+
+/**
  * @brief Validate a real assigned RS-485 node address.
  *
  * Address 0 is reserved for unassigned nodes. Address 255 is broadcast.
+ *
+ * @param node Candidate node address.
+ * @return true if node is a valid assigned node address.
  */
 static bool valid_node(uint8_t node)
 {
@@ -257,9 +293,12 @@ static bool valid_node(uint8_t node)
 /**
  * @brief Validate a public valve/channel number.
  *
- * Current slave firmware supports only 1 and 2, but the Valve Master API is
- * designed for up to 16 channels. A future capability query should report what
- * each node actually supports.
+ * Current slave firmware supports only channels 1 and 2, but the Valve Master
+ * API is designed for up to 16 channels. A future capability query should
+ * report what each node actually supports.
+ *
+ * @param channel Candidate valve/channel number.
+ * @return true if channel is within the public API range.
  */
 static bool valid_channel(uint8_t channel)
 {
@@ -267,9 +306,12 @@ static bool valid_channel(uint8_t channel)
 }
 
 /**
- * @brief Convert Valve Master result code to readable text.
+ * @brief Convert a Valve Master result code to readable text.
  *
  * These names mirror valvenode_master.c.
+ *
+ * @param result REG_RESULT value.
+ * @return Static readable result name.
  */
 static const char* result_name(uint8_t result)
 {
@@ -292,15 +334,119 @@ static const char* result_name(uint8_t result)
     }
 }
 
-/* ============================================================================
- * Object lifetime / schema setup
- * ========================================================================== */
+/**
+ * @brief Return a readable action name.
+ *
+ * @param type Action type.
+ * @return Static action name string.
+ */
+const char* VALVEMASTER_Device::actionName(action_type_t type) const
+{
+    switch(type) {
+    case ACTION_SET_VALUES:                return "SET_VALUES";
+    case ACTION_CLOSE_ALL:                 return "CLOSE_ALL";
+    case ACTION_POWER_ON_TEST:             return "POWER_ON_TEST";
+    case ACTION_POWER_OFF_TEST:            return "POWER_OFF_TEST";
+    case ACTION_PROBE_BUS:                 return "PROBE_BUS";
+    case ACTION_PING_DISCOVERED:           return "PING_DISCOVERED";
+    case ACTION_VERSION_SCAN_DISCOVERED:   return "VERSION_SCAN_DISCOVERED";
+    case ACTION_NONE:
+    default:                               return "NONE";
+    }
+}
 
+/**
+ * @brief Update cached diagnostic values.
+ *
+ * Caller must hold _mutex.
+ */
+void VALVEMASTER_Device::updateDiagnosticStateLocked()
+{
+    _state[VALUE_FIELD_POWER] = _fieldPowerOn ? "on" : "off";
+    _state[VALUE_ACTION_BUSY] = _actionBusy ? "true" : "false";
+    _state[VALUE_LAST_ACTION] = _lastActionName;
+    _state[VALUE_LAST_ACTION_OK] = _lastActionSucceeded ? "true" : "false";
+    _dataDidChange = true;
+}
+
+
+// MARK: - VALVEMASTER_Device Lifecycle
+
+/**
+ * @brief Construct the Valve Master plugin instance.
+ *
+ * The constructor follows the same style as the existing pIoTServer hardware
+ * plugins:
+ *
+ *   - Set the device identity.
+ *   - Initialize all cached runtime state.
+ *   - Publish static device metadata and runtime defaults.
+ *
+ * No I2C activity is performed here. Hardware access begins in start().
+ *
+ * @param devID pIoTServer device identifier.
+ * @param driverName pIoTServer driver name.
+ */
 VALVEMASTER_Device::VALVEMASTER_Device(string devID, string driverName)
 {
     setDeviceID(devID, driverName);
+
     _deviceState = DEVICE_STATE_UNKNOWN;
+
+    _schema.clear();
+    _state.clear();
+    _bindings.clear();
+
+    _isSetup = false;
+    _dataDidChange = false;
+
+    _i2cAddress = 0x09;
+    _powerHoldSec = DEFAULT_POWER_HOLD_SEC;
+    _isConnected = false;
+    _fieldPowerOn = false;
+
+    _lastStatus = 0;
+    _lastResult = 0;
+    _lastPowerState = 0;
+    _lastNodeCount = 0;
+    _versionHi = 0;
+    _versionLo = 0;
+
+    _running = false;
+    _stopRequested = false;
+    _actionBusy = false;
+    _powerHoldActive = false;
+    _lastActionName.clear();
+    _lastActionSucceeded = true;
+
+    json j = {
+        { PROP_DEVICE_MFG_URL,        "https://www.vinthewrench.com/" },
+        { PROP_DEVICE_MFG_PART,       "Valve Master I2C RS-485 irrigation controller" },
+
+        /*
+         * Publish runtime defaults so getProperties() shows the effective
+         * default configuration before the host or harness overrides anything.
+         */
+        { JSON_ARG_ADDRESS,           "0x09" },
+        { JSON_ARG_POWER_HOLD_SEC,    DEFAULT_POWER_HOLD_SEC }
+    };
+
+    setProperties(j);
 }
+
+/**
+ * @brief Destroy the Valve Master plugin instance.
+ *
+ * The destructor calls stop(), matching the existing pIoTServer device driver
+ * pattern used by other plugins in this codebase.
+ */
+VALVEMASTER_Device::~VALVEMASTER_Device()
+{
+    stop();
+}
+
+
+// MARK: - Schema Setup
 
 /**
  * @brief Initialize driver state from the pIoTServer schema.
@@ -313,21 +459,20 @@ VALVEMASTER_Device::VALVEMASTER_Device(string devID, string driverName)
  *   otherProps.node
  *   otherProps.valve
  *
- * Example:
+ * Cached values start "off" until pIoTServer commands otherwise. This is a
+ * requested/desired-state cache, not physical feedback from the valve hardware.
  *
- *   SPRK_1:
- *     node  = 1
- *     valve = 1
- *
- *   SPRK_2:
- *     node  = 1
- *     valve = 2
+ * @param deviceSchema Schema map supplied by pIoTServer.
+ * @return true if schema bindings were accepted.
  */
 bool VALVEMASTER_Device::initWithSchema(deviceSchemaMap_t deviceSchema)
 {
+    std::lock_guard<std::mutex> lock(_mutex);
+
     _schema = deviceSchema;
     _state.clear();
     _bindings.clear();
+    _isSetup = false;
 
     /*
      * Build initial cached state only for writable bool/actuator-like schema
@@ -350,7 +495,16 @@ bool VALVEMASTER_Device::initWithSchema(deviceSchemaMap_t deviceSchema)
         return false;
     }
 
-    LOGT_DEBUG("VALVEMASTER: schema initialized with %zu controllable keys", _state.size());
+    /*
+     * Driver diagnostic values. These are not physical valve outputs and are
+     * not backed by schema node/valve bindings.
+     */
+    updateDiagnosticStateLocked();
+
+    _isSetup = true;
+    _dataDidChange = true;
+
+    LOGT_DEBUG("VALVEMASTER: schema initialized with %zu values", _state.size());
     return true;
 }
 
@@ -360,11 +514,20 @@ bool VALVEMASTER_Device::initWithSchema(deviceSchemaMap_t deviceSchema)
  * This is where pIoTServer property names become real hardware targets.
  *
  * A schema key without valid node/valve properties is a configuration error.
+ *
+ * Read-only schema entries are ignored by the binding loader, allowing
+ * diagnostic values to be exposed without node/valve metadata.
+ *
+ * @return true if all controllable schema keys were bound successfully.
  */
 bool VALVEMASTER_Device::loadBindingsFromSchema()
 {
     for(const auto& [key, entry] : _schema) {
         if(entry.units != BOOL && entry.units != ACTUATOR) {
+            continue;
+        }
+
+        if(entry.readOnly) {
             continue;
         }
 
@@ -406,23 +569,28 @@ bool VALVEMASTER_Device::loadBindingsFromSchema()
 }
 
 /**
- * @brief Parse I2C address from device properties.
+ * @brief Parse runtime configuration from device properties.
  *
- * Property:
+ * Current property form:
  *
  *   address = "0x09"
+ *   power_hold_sec = 60
  *
- * If omitted, defaults to 0x09.
+ * If address is omitted, it defaults to 0x09.
+ * If power_hold_sec is omitted, it defaults to DEFAULT_POWER_HOLD_SEC seconds.
+ *
+ * @return true if the configured properties are valid.
  */
 bool VALVEMASTER_Device::parseI2CAddress()
 {
     string addressText = "0x09";
+    unsigned long powerHoldSec = DEFAULT_POWER_HOLD_SEC;
 
     json props;
     getProperties(props);
 
-    if(props.contains("address") && props["address"].is_string()) {
-        addressText = props["address"].get<string>();
+    if(props.contains(JSON_ARG_ADDRESS) && props[JSON_ARG_ADDRESS].is_string()) {
+        addressText = props[JSON_ARG_ADDRESS].get<string>();
     }
 
     uint8_t parsed = 0;
@@ -432,18 +600,372 @@ bool VALVEMASTER_Device::parseI2CAddress()
         return false;
     }
 
+    if(props.contains(JSON_ARG_POWER_HOLD_SEC)) {
+        if(!json_value_to_unsigned_long(props[JSON_ARG_POWER_HOLD_SEC], powerHoldSec)) {
+            LOGT_ERROR("VALVEMASTER: invalid %s property", JSON_ARG_POWER_HOLD_SEC);
+            return false;
+        }
+    }
+
     _i2cAddress = parsed;
+    _powerHoldSec = powerHoldSec;
 
     LOGT_DEBUG("VALVEMASTER: configured I2C address 0x%02x", _i2cAddress);
+    LOGT_DEBUG("VALVEMASTER: configured power_hold_sec %lu", _powerHoldSec);
+
     return true;
 }
 
-/* ============================================================================
- * Low-level I2C register access
- * ========================================================================== */
+
+// MARK: - Action Thread Helpers
+
+/**
+ * @brief Queue one asynchronous action.
+ *
+ * @param request Action to queue.
+ * @param clearPendingSetValues true to remove pending ACTION_SET_VALUES first.
+ * @return true if the action was accepted.
+ */
+bool VALVEMASTER_Device::queueAction(const action_request_t& request, bool clearPendingSetValues)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if(!_running || _stopRequested || !_isConnected) {
+        LOGT_ERROR("VALVEMASTER: queueAction rejected action=%s running=%d stop=%d connected=%d",
+                   actionName(request.type),
+                   _running ? 1 : 0,
+                   _stopRequested ? 1 : 0,
+                   _isConnected ? 1 : 0);
+        return false;
+    }
+
+    if(clearPendingSetValues) {
+        _actionQueue.erase(
+            std::remove_if(_actionQueue.begin(),
+                           _actionQueue.end(),
+                           [](const action_request_t& queued) {
+                               return queued.type == ACTION_SET_VALUES;
+                           }),
+            _actionQueue.end());
+    }
+
+    _actionQueue.push_back(request);
+    _actionCv.notify_one();
+
+    return true;
+}
+
+/**
+ * @brief Arm the automatic field-bus power-off delay.
+ */
+void VALVEMASTER_Device::armPowerHoldTimer()
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if(_powerHoldSec == 0) {
+        _powerHoldActive = false;
+        updateDiagnosticStateLocked();
+        return;
+    }
+
+    _powerHoldDeadline = chrono::steady_clock::now() + chrono::seconds(_powerHoldSec);
+    _powerHoldActive = true;
+
+    LOGT_DEBUG("VALVEMASTER: auto power-off armed for %lu second(s)", _powerHoldSec);
+
+    updateDiagnosticStateLocked();
+    _actionCv.notify_one();
+}
+
+/**
+ * @brief Cancel the automatic field-bus power-off delay.
+ */
+void VALVEMASTER_Device::cancelPowerHoldTimer()
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    _powerHoldActive = false;
+    updateDiagnosticStateLocked();
+}
+
+/**
+ * @brief Return true if the automatic field-bus power-off deadline expired.
+ *
+ * @return true if the hold timer expired.
+ */
+bool VALVEMASTER_Device::powerHoldExpired()
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    return _powerHoldActive && chrono::steady_clock::now() >= _powerHoldDeadline;
+}
+
+/**
+ * @brief Update cached last-action status.
+ *
+ * @param actionNameText Human-readable action name.
+ * @param didSucceed true if the action succeeded.
+ */
+void VALVEMASTER_Device::setLastActionStatus(const string& actionNameText, bool didSucceed)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    _lastActionName = actionNameText;
+    _lastActionSucceeded = didSucceed;
+
+    updateDiagnosticStateLocked();
+}
+
+/**
+ * @brief Main worker thread body.
+ *
+ * actionThread() owns all slow field-bus hardware operations after start().
+ */
+void VALVEMASTER_Device::actionThread()
+{
+    LOGT_DEBUG("VALVEMASTER: actionThread started");
+
+    for(;;) {
+        action_request_t request;
+        bool haveRequest = false;
+        bool doAutoPowerOff = false;
+
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+
+            if(_stopRequested) {
+                break;
+            }
+
+            if(_actionQueue.empty()) {
+                if(_fieldPowerOn && _powerHoldActive) {
+                    bool wokeForWork = _actionCv.wait_until(
+                        lock,
+                        _powerHoldDeadline,
+                        [this]() {
+                            return _stopRequested || !_actionQueue.empty();
+                        });
+
+                    if(_stopRequested) {
+                        break;
+                    }
+
+                    if(wokeForWork) {
+                        continue;
+                    }
+
+                    if(_fieldPowerOn && _powerHoldActive &&
+                       chrono::steady_clock::now() >= _powerHoldDeadline) {
+                        _powerHoldActive = false;
+                        _actionBusy = true;
+                        updateDiagnosticStateLocked();
+                        doAutoPowerOff = true;
+                    }
+                } else {
+                    _actionCv.wait(lock, [this]() {
+                        return _stopRequested || !_actionQueue.empty();
+                    });
+
+                    if(_stopRequested) {
+                        break;
+                    }
+
+                    continue;
+                }
+            } else {
+                request = _actionQueue.front();
+                _actionQueue.pop_front();
+                _actionBusy = true;
+                updateDiagnosticStateLocked();
+                haveRequest = true;
+            }
+        }
+
+        if(doAutoPowerOff) {
+            LOGT_DEBUG("VALVEMASTER: auto power-off delay expired");
+
+            bool didSucceed = powerOff();
+            setLastActionStatus("AUTO_POWER_OFF", didSucceed);
+
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                _actionBusy = false;
+                updateDiagnosticStateLocked();
+            }
+
+            continue;
+        }
+
+        if(haveRequest) {
+            bool didSucceed = executeAction(request);
+
+            setLastActionStatus(actionName(request.type), didSucceed);
+
+            if(request.callback) {
+                request.callback(didSucceed);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                _actionBusy = false;
+                updateDiagnosticStateLocked();
+            }
+
+            continue;
+        }
+    }
+
+    /*
+     * Shutdown path. Always attempt to power the field line down before the
+     * thread exits. This is best-effort; stop() still joins and closes I2C.
+     */
+    cancelPowerHoldTimer();
+
+    if(_fieldPowerOn) {
+        LOGT_DEBUG("VALVEMASTER: actionThread shutdown powering field bus off");
+        powerOff();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _actionBusy = false;
+        _running = false;
+        updateDiagnosticStateLocked();
+    }
+
+    LOGT_DEBUG("VALVEMASTER: actionThread exited");
+}
+
+/**
+ * @brief Execute one queued action.
+ *
+ * @param request Action request to execute.
+ * @return true if the action succeeded.
+ */
+bool VALVEMASTER_Device::executeAction(const action_request_t& request)
+{
+    bool didSucceed = false;
+
+    LOGT_DEBUG("VALVEMASTER: executing action %s", actionName(request.type));
+
+    switch(request.type) {
+    case ACTION_SET_VALUES:
+        didSucceed = executeSetValuesAction(request);
+
+        if(didSucceed) {
+            armPowerHoldTimer();
+        } else {
+            cancelPowerHoldTimer();
+            powerOff();
+        }
+        break;
+
+    case ACTION_CLOSE_ALL:
+        didSucceed = closeAllValves();
+        cancelPowerHoldTimer();
+        powerOff();
+        break;
+
+    case ACTION_POWER_ON_TEST:
+        didSucceed = powerOn();
+
+        if(didSucceed) {
+            armPowerHoldTimer();
+        }
+        break;
+
+    case ACTION_POWER_OFF_TEST:
+        cancelPowerHoldTimer();
+        didSucceed = powerOff();
+        break;
+
+    case ACTION_PROBE_BUS:
+        didSucceed = probeBus();
+
+        if(didSucceed) {
+            armPowerHoldTimer();
+        } else {
+            cancelPowerHoldTimer();
+            powerOff();
+        }
+        break;
+
+    case ACTION_PING_DISCOVERED:
+        didSucceed = pingDiscoveredNodes();
+
+        if(didSucceed) {
+            armPowerHoldTimer();
+        } else {
+            cancelPowerHoldTimer();
+            powerOff();
+        }
+        break;
+
+    case ACTION_VERSION_SCAN_DISCOVERED:
+        didSucceed = versionScanDiscoveredNodes();
+
+        if(didSucceed) {
+            armPowerHoldTimer();
+        } else {
+            cancelPowerHoldTimer();
+            powerOff();
+        }
+        break;
+
+    case ACTION_NONE:
+    default:
+        LOGT_ERROR("VALVEMASTER: unknown action type %d", request.type);
+        didSucceed = false;
+        break;
+    }
+
+    LOGT_DEBUG("VALVEMASTER: action %s %s",
+               actionName(request.type),
+               didSucceed ? "succeeded" : "failed");
+
+    return didSucceed;
+}
+
+/**
+ * @brief Execute ACTION_SET_VALUES on actionThread().
+ *
+ * @param request Queued set-values request.
+ * @return true if all requested hardware commands succeeded.
+ */
+bool VALVEMASTER_Device::executeSetValuesAction(const action_request_t& request)
+{
+    for(const auto& [key, requestedState] : request.values) {
+        ValveBinding binding;
+
+        if(!getBindingForKey(key, binding)) {
+            LOGT_ERROR("VALVEMASTER: actionThread no binding for key '%s'", key.c_str());
+            return false;
+        }
+
+        LOGT_DEBUG("VALVEMASTER: actionThread set '%s' node=%u valve=%u state=%s",
+                   key.c_str(),
+                   binding.node,
+                   binding.valve,
+                   requestedState ? "on" : "off");
+
+        if(!setValveChannel(binding.node, binding.valve, requestedState)) {
+            LOGT_ERROR("VALVEMASTER: actionThread set failed for key '%s'", key.c_str());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+// MARK: - Low-Level I2C Register Access
 
 /**
  * @brief Read one Valve Master register.
+ *
+ * @param reg Register address.
+ * @param valueOut Destination byte.
+ * @return true if the register read succeeded.
  */
 bool VALVEMASTER_Device::readRegister(uint8_t reg, uint8_t& valueOut)
 {
@@ -460,6 +982,10 @@ bool VALVEMASTER_Device::readRegister(uint8_t reg, uint8_t& valueOut)
 
 /**
  * @brief Write one Valve Master register.
+ *
+ * @param reg Register address.
+ * @param value Value to write.
+ * @return true if the register write succeeded.
  */
 bool VALVEMASTER_Device::writeRegister(uint8_t reg, uint8_t value)
 {
@@ -479,20 +1005,24 @@ bool VALVEMASTER_Device::writeRegister(uint8_t reg, uint8_t value)
  * The firmware defers command execution out of the TWI ISR, so this only queues
  * the command. The caller must wait for STATUS_BUSY to clear and then check
  * REG_RESULT.
+ *
+ * @param command Command byte written to REG_COMMAND.
+ * @return true if the command byte was written.
  */
 bool VALVEMASTER_Device::writeCommand(uint8_t command)
 {
     return writeRegister(REG_COMMAND, command);
 }
 
-/* ============================================================================
- * Valve Master status / command completion
- * ========================================================================== */
+
+// MARK: - Valve Master Status and Command Completion
 
 /**
  * @brief Read firmware version and status summary from the Valve Master.
  *
- * Called during start() and useful as a bring-up sanity check.
+ * Called during start() before actionThread() is launched.
+ *
+ * @return true if all summary registers were read.
  */
 bool VALVEMASTER_Device::readMasterSummary()
 {
@@ -522,6 +1052,11 @@ bool VALVEMASTER_Device::readMasterSummary()
 
     _fieldPowerOn = (_lastPowerState != 0);
 
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        updateDiagnosticStateLocked();
+    }
+
     LOGT_DEBUG("VALVEMASTER: firmware version %u.%u", _versionHi, _versionLo);
     LOGT_DEBUG("VALVEMASTER: status=0x%02x result=0x%02x power=%u nodes=%u",
                _lastStatus,
@@ -538,7 +1073,7 @@ bool VALVEMASTER_Device::readMasterSummary()
  * This is used after every command write.
  *
  * @param timeoutMs Maximum wait time.
- * @return true if not busy before timeout.
+ * @return true if the Valve Master reported not-busy before timeout.
  */
 bool VALVEMASTER_Device::waitNotBusy(uint32_t timeoutMs)
 {
@@ -568,6 +1103,9 @@ bool VALVEMASTER_Device::waitNotBusy(uint32_t timeoutMs)
  * @brief Verify REG_RESULT is RESULT_OK.
  *
  * If the command failed, this logs both the hex result and readable name.
+ *
+ * @param operation Human-readable operation name for logging.
+ * @return true if REG_RESULT is RESULT_OK.
  */
 bool VALVEMASTER_Device::checkResultOk(const char* operation)
 {
@@ -590,9 +1128,8 @@ bool VALVEMASTER_Device::checkResultOk(const char* operation)
     return true;
 }
 
-/* ============================================================================
- * Field-bus power control
- * ========================================================================== */
+
+// MARK: - Field-Bus Power Control
 
 /**
  * @brief Turn on switched 12 V field-bus power.
@@ -602,16 +1139,24 @@ bool VALVEMASTER_Device::checkResultOk(const char* operation)
  * clearing BUSY.
  *
  * The plugin caches the resulting power state in _fieldPowerOn.
+ *
+ * @return true if field-bus power is on after the command.
  */
 bool VALVEMASTER_Device::powerOn()
 {
-    if(!isConnected()) {
+    if(!_isConnected || !_i2c.isAvailable()) {
         LOGT_ERROR("VALVEMASTER: powerOn rejected, device is not connected");
         return false;
     }
 
     if(_fieldPowerOn) {
         LOGT_DEBUG("VALVEMASTER: field power already on");
+
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            updateDiagnosticStateLocked();
+        }
+
         return true;
     }
 
@@ -635,6 +1180,11 @@ bool VALVEMASTER_Device::powerOn()
 
     _fieldPowerOn = (_lastPowerState != 0);
 
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        updateDiagnosticStateLocked();
+    }
+
     LOGT_DEBUG("VALVEMASTER: field power %s", _fieldPowerOn ? "on" : "off");
 
     return _fieldPowerOn;
@@ -644,16 +1194,24 @@ bool VALVEMASTER_Device::powerOn()
  * @brief Turn off switched 12 V field-bus power.
  *
  * This commands the Valve Master to pulse the latching relay RESET coil.
+ *
+ * @return true if field-bus power is off after the command.
  */
 bool VALVEMASTER_Device::powerOff()
 {
-    if(!isConnected()) {
+    if(!_isConnected || !_i2c.isAvailable()) {
         LOGT_ERROR("VALVEMASTER: powerOff rejected, device is not connected");
         return false;
     }
 
     if(!_fieldPowerOn) {
         LOGT_DEBUG("VALVEMASTER: field power already off");
+
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            updateDiagnosticStateLocked();
+        }
+
         return true;
     }
 
@@ -677,21 +1235,23 @@ bool VALVEMASTER_Device::powerOff()
 
     _fieldPowerOn = (_lastPowerState != 0);
 
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        updateDiagnosticStateLocked();
+    }
+
     LOGT_DEBUG("VALVEMASTER: field power %s", _fieldPowerOn ? "on" : "off");
 
     return !_fieldPowerOn;
 }
 
-/* ============================================================================
- * RS-485 discovery / diagnostics through the Valve Master
- * ========================================================================== */
+
+// MARK: - RS-485 Discovery and Diagnostics Through Valve Master
 
 /**
  * @brief Run broadcast WHO discovery and read the node map.
  *
- * This sends CMD_WHO to the Valve Master. The Valve Master broadcasts :FFW on
- * the RS-485 bus, waits for slotted slave replies, and stores discovered node
- * addresses in REG_NODE_MAP.
+ * @return true if the WHO scan completed and the node map was readable.
  */
 bool VALVEMASTER_Device::probeBus()
 {
@@ -720,6 +1280,7 @@ bool VALVEMASTER_Device::probeBus()
     }
 
     _lastNodeCount = count;
+    _dataDidChange = true;
 
     LOGT_DEBUG("VALVEMASTER: WHO found %u node(s)", count);
 
@@ -742,6 +1303,9 @@ bool VALVEMASTER_Device::probeBus()
 
 /**
  * @brief Ping one RS-485 slave node through the Valve Master.
+ *
+ * @param node ValveNode address.
+ * @return true if the node replied with ACK.
  */
 bool VALVEMASTER_Device::pingNode(uint8_t node)
 {
@@ -797,6 +1361,8 @@ bool VALVEMASTER_Device::pingNode(uint8_t node)
 
 /**
  * @brief Ping every node currently listed in the Valve Master node map.
+ *
+ * @return true if all listed nodes replied successfully.
  */
 bool VALVEMASTER_Device::pingDiscoveredNodes()
 {
@@ -807,6 +1373,7 @@ bool VALVEMASTER_Device::pingDiscoveredNodes()
     }
 
     _lastNodeCount = count;
+    _dataDidChange = true;
 
     if(count > NODE_MAP_BYTES) {
         count = NODE_MAP_BYTES;
@@ -836,6 +1403,11 @@ bool VALVEMASTER_Device::pingDiscoveredNodes()
 
 /**
  * @brief Query firmware version from one RS-485 slave node.
+ *
+ * @param node ValveNode address.
+ * @param versionHiOut Destination major/high version byte.
+ * @param versionLoOut Destination minor/low version byte.
+ * @return true if the version query succeeded.
  */
 bool VALVEMASTER_Device::getNodeVersion(uint8_t node, uint8_t& versionHiOut, uint8_t& versionLoOut)
 {
@@ -906,6 +1478,8 @@ bool VALVEMASTER_Device::getNodeVersion(uint8_t node, uint8_t& versionHiOut, uin
 
 /**
  * @brief Query firmware version from every discovered node.
+ *
+ * @return true if all discovered node version queries succeeded.
  */
 bool VALVEMASTER_Device::versionScanDiscoveredNodes()
 {
@@ -916,6 +1490,7 @@ bool VALVEMASTER_Device::versionScanDiscoveredNodes()
     }
 
     _lastNodeCount = count;
+    _dataDidChange = true;
 
     if(count > NODE_MAP_BYTES) {
         count = NODE_MAP_BYTES;
@@ -945,15 +1520,29 @@ bool VALVEMASTER_Device::versionScanDiscoveredNodes()
     return true;
 }
 
-/* ============================================================================
- * Device start / stop / connection state
- * ========================================================================== */
 
+// MARK: - Device Start, Stop, and Connection State
+
+/**
+ * @brief Start the Valve Master plugin.
+ *
+ * start() validates schema setup, parses runtime properties, opens I2C, probes
+ * for an ACK, reads the Valve Master summary registers, and starts
+ * actionThread().
+ *
+ * @return true if the Valve Master was opened and actionThread() started.
+ */
 bool VALVEMASTER_Device::start()
 {
     if(_schema.empty()) {
         _deviceState = DEVICE_STATE_ERROR;
         LOGT_ERROR("VALVEMASTER: start failed, schema is empty");
+        return false;
+    }
+
+    if(!_isSetup) {
+        _deviceState = DEVICE_STATE_ERROR;
+        LOGT_ERROR("VALVEMASTER: start failed, schema setup is incomplete");
         return false;
     }
 
@@ -974,6 +1563,7 @@ bool VALVEMASTER_Device::start()
         _isConnected = false;
         _fieldPowerOn = false;
         _deviceState = DEVICE_STATE_DISCONNECTED;
+        _dataDidChange = true;
         return false;
     }
 
@@ -984,6 +1574,7 @@ bool VALVEMASTER_Device::start()
         _isConnected = false;
         _fieldPowerOn = false;
         _deviceState = DEVICE_STATE_DISCONNECTED;
+        _dataDidChange = true;
         return false;
     }
 
@@ -994,36 +1585,118 @@ bool VALVEMASTER_Device::start()
         _isConnected = false;
         _fieldPowerOn = false;
         _deviceState = DEVICE_STATE_DISCONNECTED;
+        _dataDidChange = true;
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        _stopRequested = false;
+        _running = true;
+        _actionBusy = false;
+        _powerHoldActive = false;
+        _actionQueue.clear();
+        updateDiagnosticStateLocked();
+    }
+
+    _thread = std::thread(&VALVEMASTER_Device::actionThread, this);
+
     _deviceState = DEVICE_STATE_CONNECTED;
+    _dataDidChange = true;
+
+    LOGT_DEBUG("VALVEMASTER: device started");
+
     return true;
 }
 
+/**
+ * @brief Stop the Valve Master plugin.
+ *
+ * stop() may block. It wakes actionThread(), waits for it to power down and
+ * exit, joins the thread, and then closes I2C.
+ */
 void VALVEMASTER_Device::stop()
 {
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        if(!_running && !_thread.joinable()) {
+            _i2c.stop();
+
+            _isConnected = false;
+            _fieldPowerOn = false;
+            _deviceState = DEVICE_STATE_DISCONNECTED;
+            updateDiagnosticStateLocked();
+            return;
+        }
+
+        _stopRequested = true;
+        _actionQueue.clear();
+        _powerHoldActive = false;
+        updateDiagnosticStateLocked();
+    }
+
+    _actionCv.notify_all();
+
+    if(_thread.joinable()) {
+        _thread.join();
+    }
+
     _i2c.stop();
-    _isConnected = false;
-    _fieldPowerOn = false;
-    _deviceState = DEVICE_STATE_DISCONNECTED;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        _running = false;
+        _stopRequested = false;
+        _isConnected = false;
+        _fieldPowerOn = false;
+        _deviceState = DEVICE_STATE_DISCONNECTED;
+        updateDiagnosticStateLocked();
+    }
+
+    LOGT_DEBUG("VALVEMASTER: device stopped");
 }
 
+/**
+ * @brief Report whether the Valve Master transport is connected.
+ *
+ * @return true if the driver is connected and the I2C transport is available.
+ */
 bool VALVEMASTER_Device::isConnected()
 {
+    std::lock_guard<std::mutex> lock(_mutex);
+
     return _deviceState == DEVICE_STATE_CONNECTED && _isConnected && _i2c.isAvailable();
 }
 
+/**
+ * @brief Enable or disable command handling.
+ *
+ * @param enable true to enable command handling.
+ * @return true always.
+ */
 bool VALVEMASTER_Device::setEnabled(bool enable)
 {
+    std::lock_guard<std::mutex> lock(_mutex);
+
     _isEnabled = enable;
+    _dataDidChange = true;
+
     return true;
 }
 
-/* ============================================================================
- * Schema key lookup and real valve control
- * ========================================================================== */
 
+// MARK: - Schema Key Lookup and Valve Control
+
+/**
+ * @brief Look up the ValveNode binding for a pIoTServer key.
+ *
+ * @param key pIoTServer schema/result key.
+ * @param bindingOut Destination node/channel binding.
+ * @return true if the key has a binding.
+ */
 bool VALVEMASTER_Device::getBindingForKey(const string& key, ValveBinding& bindingOut)
 {
     auto it = _bindings.find(key);
@@ -1039,13 +1712,10 @@ bool VALVEMASTER_Device::getBindingForKey(const string& key, ValveBinding& bindi
 /**
  * @brief Send CMD_SET_CHANNEL for one node/channel.
  *
- * This is the real valve actuation path used by setValues().
- *
- * Register contract:
- *   REG_ARG0 = node address
- *   REG_ARG1 = valve/channel number
- *   REG_ARG2 = 1 for on/open, 0 for off/close
- *   REG_COMMAND = CMD_SET_CHANNEL
+ * @param node ValveNode address.
+ * @param channel Valve channel number.
+ * @param on true to open/on, false to close/off.
+ * @return true if the Valve Master reported success.
  */
 bool VALVEMASTER_Device::setValveChannel(uint8_t node, uint8_t channel, bool on)
 {
@@ -1094,8 +1764,7 @@ bool VALVEMASTER_Device::setValveChannel(uint8_t node, uint8_t channel, bool on)
 /**
  * @brief Send one Valve Master close-all command.
  *
- * This does not loop over schema keys. The Valve Master broadcasts close-all
- * over RS-485 once, and each slave node closes its own local valve outputs.
+ * @return true if the Valve Master reported success.
  */
 bool VALVEMASTER_Device::closeAllValves()
 {
@@ -1117,75 +1786,111 @@ bool VALVEMASTER_Device::closeAllValves()
 }
 
 /**
- * @brief Set one or more schema values.
+ * @brief Queue one or more schema values.
  *
- * Each schema key maps to a hardware node/channel binding loaded from schema
- * otherProps.
+ * This method returns immediately after validation, cache update, and queueing.
  *
- * Example:
- *   SPRK_1 = on
- *     -> node 1, valve 1, open
- *
- *   SPRK_2 = off
- *     -> node 1, valve 2, close
+ * @param kv Key/value changes supplied by pIoTServer.
+ * @return true if all requested changes were accepted and queued.
  */
 bool VALVEMASTER_Device::setValues(keyValueMap_t kv)
 {
-    if(!_isEnabled || !isConnected()) {
-        LOGT_ERROR("VALVEMASTER: setValues rejected, device is not enabled or not connected");
-        return false;
+    action_request_t request;
+    request.type = ACTION_SET_VALUES;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        if(!_isEnabled || !_isConnected || !_running || _stopRequested) {
+            LOGT_ERROR("VALVEMASTER: setValues rejected, device is not enabled/running/connected");
+            return false;
+        }
+
+        for(const auto& [key, value] : kv) {
+            if(!_state.contains(key)) {
+                LOGT_ERROR("VALVEMASTER: setValues rejected unknown key '%s'", key.c_str());
+                return false;
+            }
+
+            if(_bindings.find(key) == _bindings.end()) {
+                LOGT_ERROR("VALVEMASTER: setValues rejected read-only or diagnostic key '%s'",
+                           key.c_str());
+                return false;
+            }
+
+            bool parsed = false;
+
+            if(!stringToBool(value, parsed)) {
+                LOGT_ERROR("VALVEMASTER: setValues rejected invalid bool value '%s' for key '%s'",
+                           value.c_str(),
+                           key.c_str());
+                return false;
+            }
+
+            ValveBinding binding;
+
+            if(!getBindingForKey(key, binding)) {
+                LOGT_ERROR("VALVEMASTER: no binding for key '%s'", key.c_str());
+                return false;
+            }
+
+            request.values.push_back(std::make_pair(key, parsed));
+
+            /*
+             * This is requested/desired state accepted by the driver. Hardware
+             * execution happens later on actionThread().
+             */
+            _state[key] = parsed ? "on" : "off";
+            _dataDidChange = true;
+
+            LOGT_DEBUG("VALVEMASTER: queued schema key '%s' node=%u valve=%u state=%s",
+                       key.c_str(),
+                       binding.node,
+                       binding.valve,
+                       parsed ? "on" : "off");
+        }
     }
 
-    for(const auto& [key, value] : kv) {
-        if(!_state.contains(key)) {
-            LOGT_ERROR("VALVEMASTER: setValues rejected unknown key '%s'", key.c_str());
-            return false;
-        }
-
-        bool parsed = false;
-        if(!parse_bool_string(value, parsed)) {
-            LOGT_ERROR("VALVEMASTER: setValues rejected invalid bool value '%s' for key '%s'",
-                       value.c_str(),
-                       key.c_str());
-            return false;
-        }
-
-        ValveBinding binding;
-
-        if(!getBindingForKey(key, binding)) {
-            LOGT_ERROR("VALVEMASTER: no binding for key '%s'", key.c_str());
-            return false;
-        }
-
-        LOGT_DEBUG("VALVEMASTER: schema key '%s' maps to node=%u valve=%u state=%s",
-                   key.c_str(),
-                   binding.node,
-                   binding.valve,
-                   parsed ? "on" : "off");
-
-        if(!setValveChannel(binding.node, binding.valve, parsed)) {
-            LOGT_ERROR("VALVEMASTER: setValues failed for key '%s'", key.c_str());
-            return false;
-        }
-
-        /*
-         * This is a cached command-state update. It means the command completed
-         * successfully according to the Valve Master. It does not prove water
-         * flow or physical valve position.
-         */
-        _state[key] = parsed ? "on" : "off";
-
-        LOGT_DEBUG("VALVEMASTER: %s = %s",
-                   key.c_str(),
-                   _state[key].c_str());
+    if(request.values.empty()) {
+        return true;
     }
 
-    return true;
+    return queueAction(request);
 }
 
+/**
+ * @brief Report whether cached values have changed.
+ *
+ * @return true if getValues() should be called.
+ */
+bool VALVEMASTER_Device::hasUpdates()
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    return _dataDidChange;
+}
+
+/**
+ * @brief Copy cached values into the pIoTServer result map.
+ *
+ * Cached valve values represent requested/desired state accepted by this
+ * driver. They do not prove physical valve state.
+ *
+ * Diagnostic values include:
+ *
+ *   VALUE_FIELD_POWER
+ *   VALUE_ACTION_BUSY
+ *   VALUE_LAST_ACTION
+ *   VALUE_LAST_ACTION_OK
+ *
+ * @param results Destination key/value map.
+ * @return true if values were copied.
+ */
 bool VALVEMASTER_Device::getValues(keyValueMap_t& results)
 {
-    if(!isConnected()) {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if(_deviceState != DEVICE_STATE_CONNECTED || !_isConnected) {
         return false;
     }
 
@@ -1193,99 +1898,137 @@ bool VALVEMASTER_Device::getValues(keyValueMap_t& results)
         results[key] = value;
     }
 
+    _dataDidChange = false;
+
     return true;
 }
 
 /**
- * @brief Turn all valves off using the hardware close-all command.
+ * @brief Queue hardware close-all.
  *
- * Important:
- *   This sends CMD_CLOSE_ALL once.
+ * allOff() clears pending ACTION_SET_VALUES, marks cached desired values off,
+ * queues ACTION_CLOSE_ALL, and returns immediately.
  *
- * It does not individually close every schema key. The Valve Master sends a
- * broadcast close-all command on RS-485. Each slave node handles its own local
- * close sequence.
+ * @return true if the close-all request was accepted.
  */
 bool VALVEMASTER_Device::allOff()
 {
-    if(!isConnected()) {
-        LOGT_ERROR("VALVEMASTER: allOff rejected, device is not connected");
-        return false;
+    action_request_t request;
+    request.type = ACTION_CLOSE_ALL;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        if(!_isConnected || !_running || _stopRequested) {
+            LOGT_ERROR("VALVEMASTER: allOff rejected, device is not running/connected");
+            return false;
+        }
+
+        /*
+         * Only clear real valve schema keys. Do not stomp diagnostic values such
+         * as field_power, action_busy, last_action, or last_action_ok.
+         */
+        for(auto& [key, value] : _state) {
+            if(_bindings.find(key) != _bindings.end()) {
+                value = "off";
+            }
+        }
+
+        updateDiagnosticStateLocked();
     }
 
-    if(!closeAllValves()) {
-        LOGT_ERROR("VALVEMASTER: allOff close-all command failed");
-        return false;
-    }
-
-    /*
-     * After close-all succeeds, all schema values are cached as off.
-     * Again, this is command-state, not sensed valve position.
-     */
-    for(auto& [key, value] : _state) {
-        value = "off";
-    }
-
-    LOGT_DEBUG("VALVEMASTER: allOff complete");
-    return true;
+    return queueAction(request, true);
 }
 
-/* ============================================================================
- * Driver/plugin version
- * ============================================================================
+
+// MARK: - Driver / Plugin Version
+
+/**
+ * @section valvemaster_driver_version Driver / Plugin Version
  *
  * This is the pIoTServer VALVEMASTER plugin/driver version.
- *
- * The Makefile should normally provide this with:
- *
- *   -DVALVEMASTER_DRIVER_VERSION=\"0.1\"
- *
- * Keep the fallback here so local/manual builds still work.
- *
- * Do not confuse this with:
- *   - Valve Master firmware version read from REG_VERSION_HI/LO
- *   - slave ValveNode firmware versions read over RS-485
  */
 
 #ifndef VALVEMASTER_DRIVER_VERSION
 #define VALVEMASTER_DRIVER_VERSION "1.0"
 #endif
 
+/**
+ * @brief Return the plugin version string.
+ *
+ * @param version Destination string.
+ * @return true if the version string was supplied.
+ */
 bool VALVEMASTER_Device::getVersion(string& version)
 {
     version = string("VALVEMASTER driver ") + VALVEMASTER_DRIVER_VERSION;
     return true;
 }
 
-/* ============================================================================
- * Lab/test API
- * ============================================================================
- *
- * These methods are called through exported C hooks in VALVEMASTER_factory.cpp.
- * They are intentionally not part of the pIoTServerDevice base API.
- */
 
+// MARK: - Lab / Test API
+
+/**
+ * @brief Queue field-bus power-on behavior.
+ *
+ * @return true if the operation was accepted.
+ */
 bool VALVEMASTER_Device::testPowerOn()
 {
-    return powerOn();
+    action_request_t request;
+    request.type = ACTION_POWER_ON_TEST;
+
+    return queueAction(request);
 }
 
+/**
+ * @brief Queue field-bus power-off behavior.
+ *
+ * @return true if the operation was accepted.
+ */
 bool VALVEMASTER_Device::testPowerOff()
 {
-    return powerOff();
+    action_request_t request;
+    request.type = ACTION_POWER_OFF_TEST;
+
+    return queueAction(request, true);
 }
 
+/**
+ * @brief Queue Valve Master WHO/node-discovery behavior.
+ *
+ * @return true if the operation was accepted.
+ */
 bool VALVEMASTER_Device::testProbeBus()
 {
-    return probeBus();
+    action_request_t request;
+    request.type = ACTION_PROBE_BUS;
+
+    return queueAction(request);
 }
 
+/**
+ * @brief Queue ping of nodes discovered by the Valve Master.
+ *
+ * @return true if the operation was accepted.
+ */
 bool VALVEMASTER_Device::testPingDiscoveredNodes()
 {
-    return pingDiscoveredNodes();
+    action_request_t request;
+    request.type = ACTION_PING_DISCOVERED;
+
+    return queueAction(request);
 }
 
+/**
+ * @brief Queue firmware version query of discovered nodes.
+ *
+ * @return true if the operation was accepted.
+ */
 bool VALVEMASTER_Device::testVersionScanDiscoveredNodes()
 {
-    return versionScanDiscoveredNodes();
+    action_request_t request;
+    request.type = ACTION_VERSION_SCAN_DISCOVERED;
+
+    return queueAction(request);
 }

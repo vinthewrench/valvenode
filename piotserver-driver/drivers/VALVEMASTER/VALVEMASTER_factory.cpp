@@ -1,20 +1,67 @@
+/**
+ * @file VALVEMASTER_factory.cpp
+ * @brief Factory and lab-test C exports for the VALVEMASTER pIoTServer plugin.
+ *
+ * pIoTServer loads device plugins through the exported factory() symbol. The
+ * factory must stay simple: create the plugin object and return it. Hardware
+ * setup belongs in VALVEMASTER_Device::start(), not here.
+ *
+ * This file also exports optional lab/bring-up hooks used by the standalone
+ * plugin test harness. Those hooks intentionally downcast the generic
+ * pIoTServerDevice pointer back to VALVEMASTER_Device so the harness can call
+ * Valve Master specific diagnostics.
+ */
+
+#include <string>
+
 #include "VALVEMASTER_Device.hpp"
 
-extern "C" pIoTServerDevice* factory(std::string devID, std::string driverName)
+using namespace std;
+
+
+/**
+ * @brief Create a VALVEMASTER plugin instance.
+ *
+ * This is the symbol pIoTServer uses when loading the device plugin.
+ *
+ * No I2C probing, schema loading, test operation, or runtime setup should be
+ * performed in the factory. Keep the factory dumb.
+ *
+ * @param devID pIoTServer device identifier.
+ * @param driverName pIoTServer driver name.
+ * @return Newly allocated plugin instance.
+ */
+extern "C" pIoTServerDevice* factory(std::string devID, string driverName)
 {
     return new VALVEMASTER_Device(devID, driverName);
 }
 
-/*
- * Lab/test hooks.
- *
- * These are not part of the pIoTServerDevice API. The standalone plugin
- * harness may find these with dlsym() and use them for hardware bring-up.
- */
 
-extern "C" bool VALVEMASTER_testPowerOn(pIoTServerDevice* dev)
+// MARK: - Hardware Bring-Up / Lab Test Hooks
+
+/**
+ * @brief Convert a generic pIoTServerDevice pointer into a VALVEMASTER device.
+ *
+ * The standalone test harness passes plugin instances around as the base class.
+ * These helpers only work for VALVEMASTER_Device objects created by factory().
+ *
+ * @param device Generic pIoTServer device pointer.
+ * @return VALVEMASTER_Device pointer, or nullptr if the cast fails.
+ */
+static VALVEMASTER_Device* asValveMaster(pIoTServerDevice* device)
 {
-    auto* valveMaster = dynamic_cast<VALVEMASTER_Device*>(dev);
+    return dynamic_cast<VALVEMASTER_Device*>(device);
+}
+
+/**
+ * @brief Test field-bus power-on behavior.
+ *
+ * @param device Plugin instance returned by factory().
+ * @return true if the test operation succeeded.
+ */
+extern "C" bool VALVEMASTER_testPowerOn(pIoTServerDevice* device)
+{
+    VALVEMASTER_Device* valveMaster = asValveMaster(device);
 
     if(valveMaster == nullptr) {
         return false;
@@ -23,9 +70,15 @@ extern "C" bool VALVEMASTER_testPowerOn(pIoTServerDevice* dev)
     return valveMaster->testPowerOn();
 }
 
-extern "C" bool VALVEMASTER_testPowerOff(pIoTServerDevice* dev)
+/**
+ * @brief Test field-bus power-off behavior.
+ *
+ * @param device Plugin instance returned by factory().
+ * @return true if the test operation succeeded.
+ */
+extern "C" bool VALVEMASTER_testPowerOff(pIoTServerDevice* device)
 {
-    auto* valveMaster = dynamic_cast<VALVEMASTER_Device*>(dev);
+    VALVEMASTER_Device* valveMaster = asValveMaster(device);
 
     if(valveMaster == nullptr) {
         return false;
@@ -34,9 +87,15 @@ extern "C" bool VALVEMASTER_testPowerOff(pIoTServerDevice* dev)
     return valveMaster->testPowerOff();
 }
 
-extern "C" bool VALVEMASTER_testProbeBus(pIoTServerDevice* dev)
+/**
+ * @brief Run Valve Master WHO/node-discovery behavior.
+ *
+ * @param device Plugin instance returned by factory().
+ * @return true if the test operation succeeded.
+ */
+extern "C" bool VALVEMASTER_testProbeBus(pIoTServerDevice* device)
 {
-    auto* valveMaster = dynamic_cast<VALVEMASTER_Device*>(dev);
+    VALVEMASTER_Device* valveMaster = asValveMaster(device);
 
     if(valveMaster == nullptr) {
         return false;
@@ -45,9 +104,15 @@ extern "C" bool VALVEMASTER_testProbeBus(pIoTServerDevice* dev)
     return valveMaster->testProbeBus();
 }
 
-extern "C" bool VALVEMASTER_testPingDiscoveredNodes(pIoTServerDevice* dev)
+/**
+ * @brief Ping nodes discovered by the Valve Master.
+ *
+ * @param device Plugin instance returned by factory().
+ * @return true if the test operation succeeded.
+ */
+extern "C" bool VALVEMASTER_testPingDiscoveredNodes(pIoTServerDevice* device)
 {
-    auto* valveMaster = dynamic_cast<VALVEMASTER_Device*>(dev);
+    VALVEMASTER_Device* valveMaster = asValveMaster(device);
 
     if(valveMaster == nullptr) {
         return false;
@@ -56,9 +121,15 @@ extern "C" bool VALVEMASTER_testPingDiscoveredNodes(pIoTServerDevice* dev)
     return valveMaster->testPingDiscoveredNodes();
 }
 
-extern "C" bool VALVEMASTER_testVersionScanDiscoveredNodes(pIoTServerDevice* dev)
+/**
+ * @brief Query firmware versions from discovered nodes.
+ *
+ * @param device Plugin instance returned by factory().
+ * @return true if the test operation succeeded.
+ */
+extern "C" bool VALVEMASTER_testVersionScanDiscoveredNodes(pIoTServerDevice* device)
 {
-    auto* valveMaster = dynamic_cast<VALVEMASTER_Device*>(dev);
+    VALVEMASTER_Device* valveMaster = asValveMaster(device);
 
     if(valveMaster == nullptr) {
         return false;

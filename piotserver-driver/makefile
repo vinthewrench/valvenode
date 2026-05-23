@@ -24,7 +24,7 @@ harness: dirs
 	$(MAKE) -C test
 
 run: all
-	./build/plugin_harness ./plugins/$(PLUGIN_NAME).$(PLUGIN_EXT)
+	./build/plugin_harness -p -d ./plugins/$(PLUGIN_NAME).$(PLUGIN_EXT)
 
 clean:
 	$(MAKE) -C $(PLUGIN_DIR) clean

@@ -10,6 +10,7 @@
 #include "pIoTServerDevice.hpp"
 #include "pIoTServerSchema.hpp"
 #include "LogMgr.hpp"
+#include "VALVEMASTER_Device.hpp"
 
 using namespace std;
 
@@ -67,6 +68,24 @@ static constexpr uint32_t STARTUP_ALLOFF_SETTLE_MS = 3000;
  * watch in logs and in the field.
  */
 static constexpr uint32_t VALVE_ACTION_GAP_MS = 2000;
+
+/*
+ * Harness field-power hold time.
+ *
+ * The production driver default is 60 seconds. The harness deliberately
+ * overrides it to 10 seconds so auto power-off can be verified during a normal
+ * test run.
+ */
+static constexpr uint32_t HARNESS_POWER_HOLD_SEC = 10;
+
+/*
+ * Wait long enough for the driver's auto power-off timer to expire.
+ *
+ * This must be longer than HARNESS_POWER_HOLD_SEC. The extra two seconds allow
+ * for scheduling jitter, logging, and the actual Valve Master power-off command.
+ */
+static constexpr uint32_t AUTO_POWER_OFF_VERIFY_WAIT_MS =
+    (HARNESS_POWER_HOLD_SEC * 1000u) + 2000u;
 
 /* ============================================================================
  * Logging / fatal helpers
@@ -129,6 +148,18 @@ static void wait_after_startup_alloff()
 {
     note("Waiting after startup allOff before bus discovery.");
     this_thread::sleep_for(chrono::milliseconds(STARTUP_ALLOFF_SETTLE_MS));
+}
+
+/**
+ * @brief Wait long enough to verify actionThread auto power-off behavior.
+ *
+ * The driver should log the auto power-off expiration and field-power-off
+ * command during this idle period.
+ */
+static void wait_for_auto_power_off_check()
+{
+    note("Waiting to verify auto power-off hold timer.");
+    this_thread::sleep_for(chrono::milliseconds(AUTO_POWER_OFF_VERIFY_WAIT_MS));
 }
 
 /* ============================================================================
@@ -401,16 +432,23 @@ static nlohmann::json make_valvemaster_props()
 {
     nlohmann::json props;
 
-    props["address"] = "0x09";
+    props[VALVEMASTER_Device::JSON_ARG_ADDRESS] = "0x09";
     props["device_type"] = "VALVEMASTER";
     props["title"] = "Valve Master I2C";
     props["interval"] = 5;
+
+    /*
+     * The driver default is 60 seconds. The harness deliberately sets this
+     * lower so a normal test run can prove that actionThread powers the field
+     * line off after the idle hold delay expires.
+     */
+    props[VALVEMASTER_Device::JSON_ARG_POWER_HOLD_SEC] = HARNESS_POWER_HOLD_SEC;
 
     return props;
 }
 
 /* ============================================================================
- * Value display
+ * Value / property display
  * ========================================================================== */
 
 static void print_values(const keyValueMap_t& values)
@@ -422,6 +460,31 @@ static void print_values(const keyValueMap_t& values)
     for(const auto& [key, value] : values) {
         LOGT_INFO("  %s = %s", key.c_str(), value.c_str());
     }
+}
+
+/**
+ * @brief Print plugin/device properties returned by pIoTServerDevice::getProperties().
+ *
+ * This verifies what properties are actually visible to the driver before and
+ * after the harness calls setProperties().
+ */
+static void print_properties_or_die(pIoTServerDevice* dev,
+                                    void* handle,
+                                    const string& header)
+{
+    (void)handle;
+
+    nlohmann::json props;
+
+    dev->getProperties(props);
+
+    note(header);
+
+    if(gQuiet_flag || !gPrint_flag) {
+        return;
+    }
+
+    LOGT_INFO("%s", props.dump(4).c_str());
 }
 
 /* ============================================================================
@@ -485,7 +548,7 @@ static void print_driver_version_or_die(pIoTServerDevice* dev,
 }
 
 /**
- * @brief Read and print all cached schema values.
+ * @brief Read and print all cached schema and diagnostic values.
  */
 static void print_values_or_die(pIoTServerDevice* dev,
                                 test_hook_fn_t testPowerOff,
@@ -507,11 +570,78 @@ static void print_values_or_die(pIoTServerDevice* dev,
 }
 
 /**
+ * @brief Read one cached value from getValues().
+ *
+ * @param dev Device instance.
+ * @param key Value key.
+ * @param valueOut Destination string.
+ * @return true if getValues() succeeded and the key exists.
+ */
+static bool get_value(pIoTServerDevice* dev,
+                      const string& key,
+                      string& valueOut)
+{
+    keyValueMap_t values;
+
+    if(!dev->getValues(values)) {
+        return false;
+    }
+
+    auto it = values.find(key);
+    if(it == values.end()) {
+        return false;
+    }
+
+    valueOut = it->second;
+    return true;
+}
+
+/**
+ * @brief Verify the driver's cached field_power diagnostic value.
+ *
+ * @param dev Device instance.
+ * @param testPowerOff Power-off hook used for cleanup on failure.
+ * @param handle dlopen() handle.
+ * @param expected Expected value, normally "on" or "off".
+ * @param description Log description.
+ */
+static void verify_field_power_or_die(pIoTServerDevice* dev,
+                                      test_hook_fn_t testPowerOff,
+                                      void* handle,
+                                      const string& expected,
+                                      const string& description)
+{
+    string value;
+
+    if(!get_value(dev, VALVEMASTER_Device::VALUE_FIELD_POWER, value)) {
+        testPowerOff(dev);
+        delete dev;
+        dlclose(handle);
+        die(string("missing ") + VALVEMASTER_Device::VALUE_FIELD_POWER + " value");
+    }
+
+    note(description + ": " + VALVEMASTER_Device::VALUE_FIELD_POWER + " = " + value);
+
+    if(value != expected) {
+        testPowerOff(dev);
+        delete dev;
+        dlclose(handle);
+        die(string("expected ") +
+            VALVEMASTER_Device::VALUE_FIELD_POWER +
+            "=" +
+            expected +
+            " but got " +
+            value);
+    }
+}
+
+/**
  * @brief Set a single schema key through pIoTServerDevice::setValues().
  *
  * This exercises the actual driver schema binding path:
  *
- *   schema key -> otherProps.node/valve -> CMD_SET_CHANNEL
+ *   schema key -> otherProps.node/valve -> queued ACTION_SET_VALUES
+ *   actionThread -> CMD_SET_CHANNEL
  */
 static void set_one_value_or_die(pIoTServerDevice* dev,
                                  test_hook_fn_t testPowerOff,
@@ -538,20 +668,9 @@ static void set_one_value_or_die(pIoTServerDevice* dev,
 /**
  * @brief Cycle every schema-backed valve on and then off.
  *
- * This exercises the real pIoTServerDevice::setValues() command path for every
- * schema key.
- *
- * For each key:
- *
- *   setValues(key = on)
- *     -> schema key lookup
- *     -> otherProps.node / otherProps.valve
- *     -> CMD_SET_CHANNEL
- *
- *   setValues(key = off)
- *     -> same path, with ARG2 = 0
- *
- * A 2 second gap is inserted after every physical valve action.
+ * This exercises the pIoTServerDevice::setValues() queue path for every schema
+ * key. The command returns immediately after validation and queueing. The
+ * actionThread later performs the real Valve Master I2C command.
  */
 static void cycle_each_schema_valve_or_die(pIoTServerDevice* dev,
                                            test_hook_fn_t testPowerOff,
@@ -619,6 +738,8 @@ static void turn_all_schema_valves_on_or_die(pIoTServerDevice* dev,
  *
  *   dev->allOff()
  *     -> VALVEMASTER_Device::allOff()
+ *     -> queued ACTION_CLOSE_ALL
+ *     -> actionThread
  *     -> closeAllValves()
  *     -> one CMD_CLOSE_ALL command
  *
@@ -700,14 +821,11 @@ int main(int argc, char* argv[])
 
     note("OK: device object created");
 
-    /* ------------------------------------------------------------------------
-     * Driver/plugin version API smoke test
-     *
-     * getVersion() reports the driver/plugin version. It should not require
-     * dev->start(), I2C, Valve Master firmware access, or RS-485 slave nodes.
-     * --------------------------------------------------------------------- */
-
     print_driver_version_or_die(dev, handle);
+
+    print_properties_or_die(dev,
+                            handle,
+                            "Device properties before harness setProperties():");
 
     auto schema = make_valvemaster_schema();
     if(!dev->initWithSchema(schema)) {
@@ -722,6 +840,10 @@ int main(int argc, char* argv[])
     dev->setProperties(props);
 
     note("OK: properties set");
+
+    print_properties_or_die(dev,
+                            handle,
+                            "Device properties after harness setProperties():");
 
     if(!dev->start()) {
         delete dev;
@@ -745,19 +867,14 @@ int main(int argc, char* argv[])
     note("Waiting for slave AVR nodes to wake.");
     this_thread::sleep_for(chrono::milliseconds(SLAVE_WAKE_SETTLE_MS));
 
+    verify_field_power_or_die(dev,
+                              testPowerOff,
+                              handle,
+                              "on",
+                              "Verified field power after startup power-on");
+
     /* ------------------------------------------------------------------------
      * Startup close-all safety command
-     *
-     * Real system policy should eventually do this during field-bus power-up.
-     * The harness does it explicitly:
-     *
-     *   power on
-     *   wait for slave AVR boot
-     *   broadcast close-all once
-     *   wait before bus discovery
-     *
-     * This puts every listening node into a known closed command-state before
-     * discovery and before schema valve testing.
      * --------------------------------------------------------------------- */
 
     all_off_or_die(dev, testPowerOff, handle);
@@ -766,6 +883,10 @@ int main(int argc, char* argv[])
 
     /* ------------------------------------------------------------------------
      * RS-485 discovery and diagnostics
+     *
+     * These test hooks are now async queue submissions. The harness no longer
+     * treats them as proof that the operation has completed before the next
+     * line runs.
      * --------------------------------------------------------------------- */
 
     note("Probing RS-485 valve-node bus.");
@@ -792,54 +913,12 @@ int main(int argc, char* argv[])
         die("VALVEMASTER_testVersionScanDiscoveredNodes() failed");
     }
 
-    /* ------------------------------------------------------------------------
-     * Initial schema value read
-     *
-     * Command path exercised:
-     *
-     *   pIoTServerDevice::getValues()
-     *     -> VALVEMASTER_Device::getValues()
-     *
-     * These values are cached command-state values. They are not sensed valve
-     * position and do not prove water flow.
-     * --------------------------------------------------------------------- */
-
     print_values_or_die(dev, testPowerOff, handle, "Initial values:");
 
     const vector<string> schemaKeys = make_ordered_schema_keys();
 
     /* ------------------------------------------------------------------------
      * One-by-one schema command test
-     *
-     * Command path exercised:
-     *
-     *   pIoTServerDevice::setValues()
-     *     -> VALVEMASTER_Device::setValues()
-     *     -> schema binding lookup
-     *     -> VALVEMASTER_Device::setValveChannel()
-     *     -> Valve Master CMD_SET_CHANNEL
-     *
-     * Test pattern for every schema key:
-     *
-     *   key on
-     *   wait 2 seconds
-     *   key off
-     *   wait 2 seconds
-     *
-     * Current schema bindings:
-     *
-     *   SPRK_1  -> node 1 valve 1
-     *   SPRK_2  -> node 1 valve 2
-     *   SPRK_3  -> node 2 valve 1
-     *   SPRK_4  -> node 2 valve 2
-     *   SPRK_5  -> node 3 valve 1
-     *   SPRK_6  -> node 3 valve 2
-     *   SPRK_7  -> node 4 valve 1
-     *   SPRK_8  -> node 4 valve 2
-     *   SPRK_9  -> node 5 valve 1
-     *   SPRK_10 -> node 5 valve 2
-     *   SPRK_11 -> node 6 valve 1
-     *   SPRK_12 -> node 6 valve 2
      * --------------------------------------------------------------------- */
 
     cycle_each_schema_valve_or_die(dev,
@@ -847,26 +926,36 @@ int main(int argc, char* argv[])
                                    handle,
                                    schemaKeys);
 
+    /*
+     * The previous valve activity should leave field power on and the driver's
+     * hold timer armed. Wait here without issuing another command so the log
+     * should show:
+     *
+     *   auto power-off delay expired
+     *   power off command
+     *   field power off
+     *
+     * This is now a real pass/fail test using the driver's field_power
+     * diagnostic value.
+     */
+    wait_for_auto_power_off_check();
+
+    print_values_or_die(dev,
+                        testPowerOff,
+                        handle,
+                        "After auto power-off timeout:");
+
+    verify_field_power_or_die(dev,
+                              testPowerOff,
+                              handle,
+                              "off",
+                              "Verified auto power-off timeout");
+
     /* ------------------------------------------------------------------------
      * All-on followed by single hardware close-all command
      *
-     * Command paths exercised:
-     *
-     *   pIoTServerDevice::setValues()
-     *     -> CMD_SET_CHANNEL for every schema key
-     *
-     *   pIoTServerDevice::allOff()
-     *     -> VALVEMASTER_Device::allOff()
-     *     -> VALVEMASTER_Device::closeAllValves()
-     *     -> one Valve Master CMD_CLOSE_ALL command
-     *
-     * The important rule:
-     *
-     *   allOff() must not loop over schema valves.
-     *
-     * It must send one hardware close-all command. The Valve Master broadcasts
-     * close-all once on the RS-485 field bus, and every slave node closes its
-     * own local outputs.
+     * The next setValues() should cause the driver to power the field bus back
+     * on because the timeout test above proved it was off.
      * --------------------------------------------------------------------- */
 
     turn_all_schema_valves_on_or_die(dev,
