@@ -5,6 +5,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "pIoTServerDevice.hpp"
 #include "pIoTServerSchema.hpp"
@@ -29,11 +30,34 @@ using factory_fn_t = pIoTServerDevice* (*)(std::string devID, std::string driver
 using test_hook_fn_t = bool (*)(pIoTServerDevice* dev);
 
 /*
- * After the Valve Master turns on field-bus power, the slave AVR nodes need
- * time to boot, initialize UART, enter RS-485 receive mode, and be ready to
- * receive the startup close-all command.
+ * Field-bus startup settle time.
+ *
+ * This is deliberately generous for the harness. After field power comes on,
+ * each slave AVR has to:
+ *
+ *   - power up
+ *   - initialize GPIO
+ *   - initialize UART
+ *   - enter RS-485 receive mode
+ *   - load EEPROM identity
+ *   - finish startup LED blink behavior
+ *   - be ready for broadcast traffic
+ *
+ * If WHO misses nodes, increase this first.
  */
-static constexpr uint32_t SLAVE_WAKE_SETTLE_MS = 1500;
+static constexpr uint32_t SLAVE_WAKE_SETTLE_MS = 5000;
+
+/*
+ * Settling time after the startup close-all broadcast.
+ *
+ * The startup allOff() is a real field-bus command. Give every node time to
+ * receive it, pulse local latching solenoids, and return to receive mode before
+ * starting WHO discovery.
+ *
+ * If WHO is still missing nodes after increasing SLAVE_WAKE_SETTLE_MS, increase
+ * this next.
+ */
+static constexpr uint32_t STARTUP_ALLOFF_SETTLE_MS = 3000;
 
 /*
  * Gap between real valve actions.
@@ -84,12 +108,27 @@ static void note(const string& msg)
 }
 
 /**
- * @brief Wait between valve actions.
+ * @brief Wait between ordinary valve actions.
  */
 static void wait_between_valve_actions()
 {
     note("Waiting before next valve action.");
     this_thread::sleep_for(chrono::milliseconds(VALVE_ACTION_GAP_MS));
+}
+
+/**
+ * @brief Wait after startup allOff() before bus discovery.
+ *
+ * This is intentionally separate from the ordinary valve-action gap because
+ * startup close-all happens before WHO discovery.
+ *
+ * If nodes are missed during WHO, this delay is one of the first things to
+ * increase after the slave wake settle time.
+ */
+static void wait_after_startup_alloff()
+{
+    note("Waiting after startup allOff before bus discovery.");
+    this_thread::sleep_for(chrono::milliseconds(STARTUP_ALLOFF_SETTLE_MS));
 }
 
 /* ============================================================================
@@ -165,16 +204,15 @@ static void setup_logging()
  * ========================================================================== */
 
 /**
- * @brief Build a small VALVEMASTER schema for harness testing.
+ * @brief Build a VALVEMASTER schema for harness testing.
  *
- * This schema intentionally maps two different pIoTServer keys to real
- * ValveNode outputs:
+ * Test schema:
  *
- *   SPRK_1 -> node 1, valve 1
- *   SPRK_2 -> node 3, valve 1
+ *   Nodes 1..6
+ *   Valves 1..2 per node
  *
- * That proves the driver is not hardcoded to one node and one valve. It must
- * read node/valve binding from schema otherProps.
+ * This gives twelve schema-backed outputs and verifies that the driver does
+ * not assume one node, one valve, or a hardcoded schema layout.
  */
 static deviceSchemaMap_t make_valvemaster_schema()
 {
@@ -199,12 +237,159 @@ static deviceSchemaMap_t make_valvemaster_schema()
     sprk2.readOnly = false;
     sprk2.queryDelay = 5;
     sprk2.otherProps = {
-        {"node", 3},
-        {"valve", 1}
+        {"node", 1},
+        {"valve", 2}
     };
     schema["SPRK_2"] = sprk2;
 
+    deviceSchema_t sprk3;
+    sprk3.title = "C. Tomatoes";
+    sprk3.units = BOOL;
+    sprk3.tracking = TR_IGNORE;
+    sprk3.readOnly = false;
+    sprk3.queryDelay = 5;
+    sprk3.otherProps = {
+        {"node", 2},
+        {"valve", 1}
+    };
+    schema["SPRK_3"] = sprk3;
+
+    deviceSchema_t sprk4;
+    sprk4.title = "D. Peppers";
+    sprk4.units = BOOL;
+    sprk4.tracking = TR_IGNORE;
+    sprk4.readOnly = false;
+    sprk4.queryDelay = 5;
+    sprk4.otherProps = {
+        {"node", 2},
+        {"valve", 2}
+    };
+    schema["SPRK_4"] = sprk4;
+
+    deviceSchema_t sprk5;
+    sprk5.title = "E. Beans";
+    sprk5.units = BOOL;
+    sprk5.tracking = TR_IGNORE;
+    sprk5.readOnly = false;
+    sprk5.queryDelay = 5;
+    sprk5.otherProps = {
+        {"node", 3},
+        {"valve", 1}
+    };
+    schema["SPRK_5"] = sprk5;
+
+    deviceSchema_t sprk6;
+    sprk6.title = "F. Squash";
+    sprk6.units = BOOL;
+    sprk6.tracking = TR_IGNORE;
+    sprk6.readOnly = false;
+    sprk6.queryDelay = 5;
+    sprk6.otherProps = {
+        {"node", 3},
+        {"valve", 2}
+    };
+    schema["SPRK_6"] = sprk6;
+
+    deviceSchema_t sprk7;
+    sprk7.title = "G. Corn";
+    sprk7.units = BOOL;
+    sprk7.tracking = TR_IGNORE;
+    sprk7.readOnly = false;
+    sprk7.queryDelay = 5;
+    sprk7.otherProps = {
+        {"node", 4},
+        {"valve", 1}
+    };
+    schema["SPRK_7"] = sprk7;
+
+    deviceSchema_t sprk8;
+    sprk8.title = "H. Melons";
+    sprk8.units = BOOL;
+    sprk8.tracking = TR_IGNORE;
+    sprk8.readOnly = false;
+    sprk8.queryDelay = 5;
+    sprk8.otherProps = {
+        {"node", 4},
+        {"valve", 2}
+    };
+    schema["SPRK_8"] = sprk8;
+
+    deviceSchema_t sprk9;
+    sprk9.title = "I. Herbs";
+    sprk9.units = BOOL;
+    sprk9.tracking = TR_IGNORE;
+    sprk9.readOnly = false;
+    sprk9.queryDelay = 5;
+    sprk9.otherProps = {
+        {"node", 5},
+        {"valve", 1}
+    };
+    schema["SPRK_9"] = sprk9;
+
+    deviceSchema_t sprk10;
+    sprk10.title = "J. Lettuce";
+    sprk10.units = BOOL;
+    sprk10.tracking = TR_IGNORE;
+    sprk10.readOnly = false;
+    sprk10.queryDelay = 5;
+    sprk10.otherProps = {
+        {"node", 5},
+        {"valve", 2}
+    };
+    schema["SPRK_10"] = sprk10;
+
+    deviceSchema_t sprk11;
+    sprk11.title = "K. Carrots";
+    sprk11.units = BOOL;
+    sprk11.tracking = TR_IGNORE;
+    sprk11.readOnly = false;
+    sprk11.queryDelay = 5;
+    sprk11.otherProps = {
+        {"node", 6},
+        {"valve", 1}
+    };
+    schema["SPRK_11"] = sprk11;
+
+    deviceSchema_t sprk12;
+    sprk12.title = "L. Beets";
+    sprk12.units = BOOL;
+    sprk12.tracking = TR_IGNORE;
+    sprk12.readOnly = false;
+    sprk12.queryDelay = 5;
+    sprk12.otherProps = {
+        {"node", 6},
+        {"valve", 2}
+    };
+    schema["SPRK_12"] = sprk12;
+
     return schema;
+}
+
+/**
+ * @brief Return the ordered schema keys used by this harness.
+ *
+ * Keep this list in the same order as make_valvemaster_schema().
+ *
+ * The schema map itself is ordered by key name, but an explicit vector makes
+ * the command test sequence obvious and prevents accidental ordering surprises
+ * if names change later.
+ */
+static vector<string> make_ordered_schema_keys()
+{
+    return {
+        "SPRK_1",
+        "SPRK_2",
+        "SPRK_3",
+        "SPRK_4",
+        "SPRK_5",
+        "SPRK_6",
+        "SPRK_7",
+        "SPRK_8",
+        "SPRK_9",
+        "SPRK_10",
+        "SPRK_11",
+        "SPRK_12"
+    };
 }
 
 /**
@@ -351,6 +536,83 @@ static void set_one_value_or_die(pIoTServerDevice* dev,
 }
 
 /**
+ * @brief Cycle every schema-backed valve on and then off.
+ *
+ * This exercises the real pIoTServerDevice::setValues() command path for every
+ * schema key.
+ *
+ * For each key:
+ *
+ *   setValues(key = on)
+ *     -> schema key lookup
+ *     -> otherProps.node / otherProps.valve
+ *     -> CMD_SET_CHANNEL
+ *
+ *   setValues(key = off)
+ *     -> same path, with ARG2 = 0
+ *
+ * A 2 second gap is inserted after every physical valve action.
+ */
+static void cycle_each_schema_valve_or_die(pIoTServerDevice* dev,
+                                           test_hook_fn_t testPowerOff,
+                                           void* handle,
+                                           const vector<string>& keys)
+{
+    for(const auto& key : keys) {
+        set_one_value_or_die(dev,
+                             testPowerOff,
+                             handle,
+                             key,
+                             "on",
+                             "Turning " + key + " on.");
+        print_values_or_die(dev,
+                            testPowerOff,
+                            handle,
+                            "After " + key + " on:");
+        wait_between_valve_actions();
+
+        set_one_value_or_die(dev,
+                             testPowerOff,
+                             handle,
+                             key,
+                             "off",
+                             "Turning " + key + " off.");
+        print_values_or_die(dev,
+                            testPowerOff,
+                            handle,
+                            "After " + key + " off:");
+        wait_between_valve_actions();
+    }
+}
+
+/**
+ * @brief Turn every schema-backed valve on before the close-all test.
+ *
+ * This deliberately uses setValues() once per key so the log shows each schema
+ * command clearly. After this, the harness calls allOff(), which must send one
+ * hardware CMD_CLOSE_ALL broadcast rather than individually closing keys.
+ */
+static void turn_all_schema_valves_on_or_die(pIoTServerDevice* dev,
+                                             test_hook_fn_t testPowerOff,
+                                             void* handle,
+                                             const vector<string>& keys)
+{
+    for(const auto& key : keys) {
+        set_one_value_or_die(dev,
+                             testPowerOff,
+                             handle,
+                             key,
+                             "on",
+                             "Turning " + key + " on for all-off command test.");
+        print_values_or_die(dev,
+                            testPowerOff,
+                            handle,
+                            "After " + key + " on for all-off test:");
+        wait_between_valve_actions();
+    }
+}
+
+/**
  * @brief Call pIoTServerDevice::allOff().
  *
  * This must exercise the VALVEMASTER close-all path:
@@ -492,7 +754,7 @@ int main(int argc, char* argv[])
      *   power on
      *   wait for slave AVR boot
      *   broadcast close-all once
-     *   wait 2 seconds
+     *   wait before bus discovery
      *
      * This puts every listening node into a known closed command-state before
      * discovery and before schema valve testing.
@@ -500,7 +762,7 @@ int main(int argc, char* argv[])
 
     all_off_or_die(dev, testPowerOff, handle);
     print_values_or_die(dev, testPowerOff, handle, "After startup hardware allOff:");
-    wait_between_valve_actions();
+    wait_after_startup_alloff();
 
     /* ------------------------------------------------------------------------
      * RS-485 discovery and diagnostics
@@ -532,69 +794,85 @@ int main(int argc, char* argv[])
 
     /* ------------------------------------------------------------------------
      * Initial schema value read
+     *
+     * Command path exercised:
+     *
+     *   pIoTServerDevice::getValues()
+     *     -> VALVEMASTER_Device::getValues()
+     *
+     * These values are cached command-state values. They are not sensed valve
+     * position and do not prove water flow.
      * --------------------------------------------------------------------- */
 
     print_values_or_die(dev, testPowerOff, handle, "Initial values:");
 
+    const vector<string> schemaKeys = make_ordered_schema_keys();
+
     /* ------------------------------------------------------------------------
-     * One-by-one schema actuation test
+     * One-by-one schema command test
      *
-     * This verifies that each schema key maps to the correct node/valve pair.
-     * Each action is separated by at least 2 seconds.
+     * Command path exercised:
+     *
+     *   pIoTServerDevice::setValues()
+     *     -> VALVEMASTER_Device::setValues()
+     *     -> schema binding lookup
+     *     -> VALVEMASTER_Device::setValveChannel()
+     *     -> Valve Master CMD_SET_CHANNEL
+     *
+     * Test pattern for every schema key:
+     *
+     *   key on
+     *   wait 2 seconds
+     *   key off
+     *   wait 2 seconds
+     *
+     * Current schema bindings:
+     *
+     *   SPRK_1  -> node 1 valve 1
+     *   SPRK_2  -> node 1 valve 2
+     *   SPRK_3  -> node 2 valve 1
+     *   SPRK_4  -> node 2 valve 2
+     *   SPRK_5  -> node 3 valve 1
+     *   SPRK_6  -> node 3 valve 2
+     *   SPRK_7  -> node 4 valve 1
+     *   SPRK_8  -> node 4 valve 2
+     *   SPRK_9  -> node 5 valve 1
+     *   SPRK_10 -> node 5 valve 2
+     *   SPRK_11 -> node 6 valve 1
+     *   SPRK_12 -> node 6 valve 2
      * --------------------------------------------------------------------- */
 
-    set_one_value_or_die(dev, testPowerOff, handle,
-                         "SPRK_1",
-                         "on",
-                         "Turning SPRK_1 on.");
-    print_values_or_die(dev, testPowerOff, handle, "After SPRK_1 on:");
-    wait_between_valve_actions();
-
-    set_one_value_or_die(dev, testPowerOff, handle,
-                         "SPRK_1",
-                         "off",
-                         "Turning SPRK_1 off.");
-    print_values_or_die(dev, testPowerOff, handle, "After SPRK_1 off:");
-    wait_between_valve_actions();
-
-    set_one_value_or_die(dev, testPowerOff, handle,
-                         "SPRK_2",
-                         "on",
-                         "Turning SPRK_2 on.");
-    print_values_or_die(dev, testPowerOff, handle, "After SPRK_2 on:");
-    wait_between_valve_actions();
-
-    set_one_value_or_die(dev, testPowerOff, handle,
-                         "SPRK_2",
-                         "off",
-                         "Turning SPRK_2 off.");
-    print_values_or_die(dev, testPowerOff, handle, "After SPRK_2 off:");
-    wait_between_valve_actions();
+    cycle_each_schema_valve_or_die(dev,
+                                   testPowerOff,
+                                   handle,
+                                   schemaKeys);
 
     /* ------------------------------------------------------------------------
      * All-on followed by single hardware close-all command
      *
-     * This verifies two separate things:
+     * Command paths exercised:
      *
-     *   1. setValues() can turn multiple schema-backed valves on.
-     *   2. allOff() sends one Valve Master CMD_CLOSE_ALL command.
+     *   pIoTServerDevice::setValues()
+     *     -> CMD_SET_CHANNEL for every schema key
      *
-     * allOff() must not loop over the schema and individually close each valve.
+     *   pIoTServerDevice::allOff()
+     *     -> VALVEMASTER_Device::allOff()
+     *     -> VALVEMASTER_Device::closeAllValves()
+     *     -> one Valve Master CMD_CLOSE_ALL command
+     *
+     * The important rule:
+     *
+     *   allOff() must not loop over schema valves.
+     *
+     * It must send one hardware close-all command. The Valve Master broadcasts
+     * close-all once on the RS-485 field bus, and every slave node closes its
+     * own local outputs.
      * --------------------------------------------------------------------- */
 
-    set_one_value_or_die(dev, testPowerOff, handle,
-                         "SPRK_1",
-                         "on",
-                         "Turning SPRK_1 on for all-off command test.");
-    print_values_or_die(dev, testPowerOff, handle, "After SPRK_1 on for all-off test:");
-    wait_between_valve_actions();
-
-    set_one_value_or_die(dev, testPowerOff, handle,
-                         "SPRK_2",
-                         "on",
-                         "Turning SPRK_2 on for all-off command test.");
-    print_values_or_die(dev, testPowerOff, handle, "After SPRK_2 on for all-off test:");
-    wait_between_valve_actions();
+    turn_all_schema_valves_on_or_die(dev,
+                                     testPowerOff,
+                                     handle,
+                                     schemaKeys);
 
     all_off_or_die(dev, testPowerOff, handle);
     print_values_or_die(dev, testPowerOff, handle, "After hardware allOff:");

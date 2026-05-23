@@ -12,7 +12,7 @@
  * ----------------
  *
  * Request format:
- *   :DDC[A][KK]<EOL>
+ *   :DDC[A]KK<EOL>
  *
  * Reply format:
  *   :DDC[A][B]KK<EOL>
@@ -23,7 +23,8 @@
  *   - C    1 character command
  *   - A    optional 1 character argument
  *   - B    optional 1 character second argument in replies
- *   - KK   optional 2 hex digit checksum on requests
+ *   - KK   2 hex digit checksum on requests when REQUIRE_RX_CHECKSUM is enabled
+ *          optional only when REQUIRE_RX_CHECKSUM is disabled
  *          required 2 hex digit checksum on replies
  *   - EOL  CR, LF, or CRLF
  *
@@ -32,22 +33,22 @@
  *   - FF     broadcast address
  *   - 00     invalid / unassigned address
  *
- * Supported requests:
- *   - :04P   ping node 04
- *   - :04O1  open valve 1 on node 04
- *   - :04C1  close valve 1 on node 04
- *   - :04O2  open valve 2 on node 04
- *   - :04C2  close valve 2 on node 04
- *   - :04S1  status valve 1 on node 04
- *   - :04S2  status valve 2 on node 04
- *   - :04V   get firmware version from node 04
- *   - :04I   enable identify/blink mode on node 04
- *   - :04M   put node 04 into config mode
- *   - :00M   put an unassigned node into config mode
- *   - :DDN   assign new address DD while node is in config mode
- *   - :FFW   broadcast WHO discovery
- *   - :FFC   broadcast close all local valves
- *   - :FFX   broadcast cancel config / identify mode
+ * Correct checksummed request examples:
+ *   - :04PB4   ping node 04
+ *   - :04O1E4  open valve 1 on node 04
+ *   - :04C1D8  close valve 1 on node 04
+ *   - :04O2E5  open valve 2 on node 04
+ *   - :04C2D9  close valve 2 on node 04
+ *   - :04S1E8  status valve 1 on node 04
+ *   - :04S2E9  status valve 2 on node 04
+ *   - :04VBA   get firmware version from node 04
+ *   - :04IAD   enable identify/blink mode on node 04
+ *   - :04MB1   put node 04 into config mode
+ *   - :00MAD   put an unassigned node into config mode
+ *   - :04NB2   assign new address 04 while node is in config mode
+ *   - :FFWE3   broadcast WHO discovery
+ *   - :FFCCF   broadcast close all local valves
+ *   - :FFXE4   broadcast cancel config / identify mode
  *
  * Command letters:
  *   - P  ping, directed only, replies ACK
@@ -73,7 +74,7 @@
  *   - :04R2CKK     node 04 valve 2 closed
  *
  * Example version reply:
- *   - :04V010580   node 04 firmware version 1.05
+ *   - :04V0107KK   node 04 firmware version 1.07
  *
  * Checksum:
  *   8-bit sum of ASCII body bytes modulo 256.
@@ -83,7 +84,9 @@
  *   - Active-low status LED on PB0
  *   - RS-485 DE and /RE are tied together on PD2
  *   - Replies always include checksum
- *   - Requests may omit checksum
+ *   - Requests require checksum by default
+ *   - Checksumless requests are allowed only if REQUIRE_RX_CHECKSUM is disabled
+ *   - Config/address commands require checksum if REQUIRE_CONFIG_CHECKSUM is enabled
  *   - Node address is stored in EEPROM and copied into RAM at boot
  *   - EEPROM identity uses one packed magic/address/inverse-address record
  *   - Fresh blank EEPROM is treated as unassigned, not corrupt
@@ -97,6 +100,13 @@
  *   The stored valve state is the last commanded state. This firmware does not
  *   sense actual valve position, water flow, or whether a solenoid is physically
  *   connected.
+ *
+ * Failure analysis note:
+ *   The only firmware path that writes EEPROM is save_node_addr(), called from
+ *   the N command while g_config_mode is true. With checksumless config enabled,
+ *   a valid-looking :DDM followed by :DDN can enter config mode and rewrite the
+ *   identity record. Hammering the bus increases exposure to malformed frames,
+ *   collisions, or noise that can accidentally look like short commands.
  */
 
 #define F_CPU 8000000UL
@@ -119,10 +129,11 @@
  *   0x0100 = 1.00
  *   0x0104 = 1.04
  *   0x0105 = 1.05
+ *   0x0107 = 1.07
  *   0x0215 = 2.15
  */
 #ifndef FW_VERSION
-#define FW_VERSION 0x0106
+#define FW_VERSION 0x0107
 #endif
 
 /** @brief Default runtime address for an unassigned node. */
@@ -160,6 +171,39 @@
 
 /** @brief Maximum body length excluding ':' and EOL. */
 #define RX_BODY_MAX_CHARS              8
+
+/**
+ * @brief Require checksums on all received request frames.
+ *
+ * Default production value is 1.
+ *
+ * Temporary compatibility setting while the current master still sends
+ * checksumless requests:
+ *
+ *   -DREQUIRE_RX_CHECKSUM=0
+ *
+ * That allows normal old master traffic through while the master is updated.
+ */
+#ifndef REQUIRE_RX_CHECKSUM
+#define REQUIRE_RX_CHECKSUM            1
+#endif
+
+/**
+ * @brief Require checksums on EEPROM/configuration-changing commands.
+ *
+ * Default production value is 1.
+ *
+ * This protects the EEPROM write path from checksumless M/N traffic. The safer
+ * bridge build while the master is still checksumless is:
+ *
+ *   -DREQUIRE_RX_CHECKSUM=0 -DREQUIRE_CONFIG_CHECKSUM=1
+ *
+ * Setting this to 0 recreates the old vulnerable behavior and should only be
+ * used for a short compatibility test.
+ */
+#ifndef REQUIRE_CONFIG_CHECKSUM
+#define REQUIRE_CONFIG_CHECKSUM        1
+#endif
 
 /** @brief Config mode timeout in milliseconds. */
 #define CONFIG_MODE_TIMEOUT_MS         30000u
@@ -365,9 +409,11 @@ static uint8_t load_node_addr(addr_load_status_t *status)
         return DEFAULT_NODE_ADDR;
     }
 
+    uint8_t invalid_addr_inv = (uint8_t)(~NODE_INVALID_ADDR);
+
     if ((id.magic == EEPROM_ADDR_MAGIC) &&
         (id.addr == NODE_INVALID_ADDR) &&
-        (id.addr_inv == (uint8_t)~NODE_INVALID_ADDR)) {
+        (id.addr_inv == invalid_addr_inv)) {
         *status = ADDR_LOAD_UNASSIGNED;
         return DEFAULT_NODE_ADDR;
     }
@@ -382,7 +428,9 @@ static uint8_t load_node_addr(addr_load_status_t *status)
         return DEFAULT_NODE_ADDR;
     }
 
-    if (id.addr_inv != (uint8_t)~id.addr) {
+    uint8_t expected_addr_inv = (uint8_t)(~id.addr);
+
+    if (id.addr_inv != expected_addr_inv) {
         *status = ADDR_LOAD_CORRUPT;
         return DEFAULT_NODE_ADDR;
     }
@@ -409,12 +457,23 @@ static bool save_node_addr(uint8_t addr)
         return false;
     }
 
+    uint8_t expected_addr_inv = (uint8_t)(~addr);
+
     id.magic = EEPROM_ADDR_MAGIC;
     id.addr = addr;
-    id.addr_inv = (uint8_t)~addr;
+    id.addr_inv = expected_addr_inv;
 
+    /*
+     * EEPROM writes are slow compared with normal RAM/register writes.
+     * Reset watchdog immediately before and after so a watchdog reset is less
+     * likely to land in the middle of the identity update.
+     */
+    wdt_reset();
     eeprom_update_block(&id, &ee_node_identity, sizeof(id));
+    wdt_reset();
+
     eeprom_read_block(&verify, &ee_node_identity, sizeof(verify));
+    wdt_reset();
 
     if (verify.magic != EEPROM_ADDR_MAGIC) {
         return false;
@@ -424,7 +483,7 @@ static bool save_node_addr(uint8_t addr)
         return false;
     }
 
-    if (verify.addr_inv != (uint8_t)~addr) {
+    if (verify.addr_inv != expected_addr_inv) {
         return false;
     }
 
@@ -1199,59 +1258,22 @@ static bool g_rx_active = false;
 /**
  * @brief Execute one decoded protocol command.
  *
- * Command summary:
- *
- *   N / n:
- *     Assign a New node address while already in config mode.
- *     The address used in the frame, DD, is the new address.
- *     Example: :04N assigns address 04 to the node currently in config mode.
- *
- *   M / m:
- *     Enter config Mode.
- *     Directed to current address, or to 00 for an unassigned node.
- *     Example: :04M puts node 04 into config mode.
- *     Example: :00M puts an unassigned node into config mode.
- *
- *   X / x:
- *     Broadcast cancel.
- *     Only accepted as :FFX.
- *     Exits config mode and/or identify mode.
- *
- *   I / i:
- *     Identify.
- *     Directed only. Starts fast LED blink so the physical node can be found.
- *
- *   P / p:
- *     Ping.
- *     Directed only. Replies ACK and flashes LED briefly.
- *
- *   O / o:
- *     Open valve.
- *     Directed only. Argument is valve channel: '1' or '2'.
- *
- *   C / c:
- *     Close valve when directed with argument '1' or '2'.
- *     Broadcast close-all when sent as :FFC with no argument.
- *
- *   S / s:
- *     Status query.
- *     Directed only. Argument is valve channel: '1' or '2'.
- *     Replies R + channel + state.
- *
- *   W / w:
- *     WHO discovery.
- *     Broadcast only. Assigned nodes reply after address-based slot delay.
- *
- *   V / v:
- *     Version query.
- *     Directed only. Replies with packed FW_VERSION.
- *
  * @param addr Decoded destination address from frame.
  * @param cmd Decoded command letter.
  * @param arg Optional command argument, or 0 if no argument was supplied.
+ * @param checksum_present true if request included a valid checksum.
  */
-static void handle_command(uint8_t addr, char cmd, char arg)
+static void handle_command(uint8_t addr, char cmd, char arg, bool checksum_present)
 {
+#if !REQUIRE_CONFIG_CHECKSUM
+    /*
+     * When config checksum enforcement is compiled out, checksum_present may
+     * not be referenced below. Keep -Werror happy without weakening checked
+     * builds.
+     */
+    (void)checksum_present;
+#endif
+
     bool handled = false;
     bool stay_in_config = false;
 
@@ -1265,7 +1287,16 @@ static void handle_command(uint8_t addr, char cmd, char arg)
          * Only valid while already in config mode. The target address in the
          * frame is the new assigned address. This avoids needing a separate
          * argument field for the new address.
+         *
+         * This command writes EEPROM, so it requires a valid checksum when
+         * REQUIRE_CONFIG_CHECKSUM is enabled.
          */
+#if REQUIRE_CONFIG_CHECKSUM
+        if (!checksum_present) {
+            return;
+        }
+#endif
+
         if (!g_config_mode) {
             return;
         }
@@ -1300,7 +1331,16 @@ static void handle_command(uint8_t addr, char cmd, char arg)
          * Allows the node to accept N/new-address command. Assigned nodes enter
          * config mode using their current address. Blank/unassigned nodes enter
          * config mode using address 00.
+         *
+         * This command unlocks EEPROM assignment, so it requires a valid
+         * checksum when REQUIRE_CONFIG_CHECKSUM is enabled.
          */
+#if REQUIRE_CONFIG_CHECKSUM
+        if (!checksum_present) {
+            return;
+        }
+#endif
+
         if (!config_entry_addr_matches(addr)) {
             return;
         }
@@ -1545,13 +1585,17 @@ static void handle_command(uint8_t addr, char cmd, char arg)
 /**
  * @brief Parse and validate a completed frame body.
  *
- * The body excludes ':' and CR/LF. Accepted request body lengths:
- *   - 3 bytes: DD + command
- *   - 4 bytes: DD + command + arg
+ * The body excludes ':' and CR/LF.
+ *
+ * With REQUIRE_RX_CHECKSUM enabled, accepted request body lengths are:
  *   - 5 bytes: DD + command + checksum
  *   - 6 bytes: DD + command + arg + checksum
  *
- * Checksums on requests are optional. If supplied, they must match.
+ * With REQUIRE_RX_CHECKSUM disabled, checksumless forms are also accepted:
+ *   - 3 bytes: DD + command
+ *   - 4 bytes: DD + command + arg
+ *
+ * If a checksum is supplied, it must match.
  *
  * @param body Frame body buffer.
  * @param len Body length.
@@ -1564,6 +1608,7 @@ static void process_body(char *body, uint8_t len)
     uint8_t rx_cs;
     uint8_t calc_cs;
     uint8_t cs_start_index;
+    bool checksum_present = false;
 
     if ((len != 3u) && (len != 4u) && (len != 5u) && (len != 6u)) {
         return;
@@ -1580,6 +1625,7 @@ static void process_body(char *body, uint8_t len)
     }
 
     if ((len == 5u) || (len == 6u)) {
+        checksum_present = true;
         cs_start_index = len - 2u;
 
         if (!hex_pair_to_u8(body[cs_start_index], body[cs_start_index + 1u], &rx_cs)) {
@@ -1592,7 +1638,13 @@ static void process_body(char *body, uint8_t len)
         }
     }
 
-    handle_command(addr, cmd, arg);
+#if REQUIRE_RX_CHECKSUM
+    if (!checksum_present) {
+        return;
+    }
+#endif
+
+    handle_command(addr, cmd, arg, checksum_present);
 }
 
 /**
