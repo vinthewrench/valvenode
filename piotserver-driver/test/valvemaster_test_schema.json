@@ -1,0 +1,76 @@
+{
+    "values": [
+        {
+            "key": "SPRK_1",
+            "title": "A. Chard/Kale",
+            "node": 1,
+            "valve": 1
+        },
+        {
+            "key": "SPRK_2",
+            "title": "B. Cucumbers",
+            "node": 1,
+            "valve": 2
+        },
+        {
+            "key": "SPRK_3",
+            "title": "C. Tomatoes",
+            "node": 2,
+            "valve": 1
+        },
+        {
+            "key": "SPRK_4",
+            "title": "D. Peppers",
+            "node": 2,
+            "valve": 2
+        },
+        {
+            "key": "SPRK_5",
+            "title": "E. Beans",
+            "node": 3,
+            "valve": 1
+        },
+        {
+            "key": "SPRK_6",
+            "title": "F. Squash",
+            "node": 3,
+            "valve": 2
+        },
+        {
+            "key": "SPRK_7",
+            "title": "G. Corn",
+            "node": 4,
+            "valve": 1
+        },
+        {
+            "key": "SPRK_8",
+            "title": "H. Melons",
+            "node": 4,
+            "valve": 2
+        },
+        {
+            "key": "SPRK_9",
+            "title": "I. Herbs",
+            "node": 5,
+            "valve": 1
+        },
+        {
+            "key": "SPRK_10",
+            "title": "J. Lettuce",
+            "node": 5,
+            "valve": 2
+        },
+        {
+            "key": "SPRK_11",
+            "title": "K. Carrots",
+            "node": 6,
+            "valve": 1
+        },
+        {
+            "key": "SPRK_12",
+            "title": "L. Beets",
+            "node": 6,
+            "valve": 2
+        }
+    ]
+}

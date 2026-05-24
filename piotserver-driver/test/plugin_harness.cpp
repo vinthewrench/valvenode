@@ -1,7 +1,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <dlfcn.h>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -13,6 +15,16 @@
 #include "VALVEMASTER_Device.hpp"
 
 using namespace std;
+
+/*
+ * Test harness revision.
+ *
+ * This is the standalone plugin_harness revision, not the VALVEMASTER plugin
+ * version, not the Valve Master firmware version, and not the ValveNode slave
+ * firmware version.
+ */
+static constexpr const char* HARNESS_REVISION = "1.1";
+
 
 /* ============================================================================
  * Global flags
@@ -29,6 +41,7 @@ int gQuiet_flag   = 0;
 
 using factory_fn_t = pIoTServerDevice* (*)(std::string devID, std::string driverName);
 using test_hook_fn_t = bool (*)(pIoTServerDevice* dev);
+using wait_idle_hook_fn_t = bool (*)(pIoTServerDevice* dev, uint32_t timeoutMs);
 
 /*
  * Field-bus startup settle time.
@@ -86,6 +99,27 @@ static constexpr uint32_t HARNESS_POWER_HOLD_SEC = 10;
  */
 static constexpr uint32_t AUTO_POWER_OFF_VERIFY_WAIT_MS =
     (HARNESS_POWER_HOLD_SEC * 1000u) + 2000u;
+
+/*
+ * Maximum time to wait for ordinary queued async driver actions to finish.
+ *
+ * This is enough for normal set-channel, power-on, power-off, and close-all
+ * actions.
+ */
+static constexpr uint32_t ACTION_IDLE_TIMEOUT_MS = 20000;
+
+/*
+ * Maximum time to wait for WHO/version style bus discovery actions.
+ *
+ * The driver may now do:
+ *
+ *   - 5 sec field power-on settle
+ *   - 3 WHO passes
+ *   - retry gaps between passes
+ *
+ * So 20 seconds is too short for discovery.
+ */
+static constexpr uint32_t ACTION_DISCOVERY_IDLE_TIMEOUT_MS = 45000;
 
 /* ============================================================================
  * Logging / fatal helpers
@@ -235,192 +269,150 @@ static void setup_logging()
  * ========================================================================== */
 
 /**
- * @brief Build a VALVEMASTER schema for harness testing.
+ * @brief Default schema file used by the harness.
  *
- * Test schema:
+ * make run is normally launched from piotserver-driver, so this path is
+ * relative to that directory.
+ */
+static constexpr const char* DEFAULT_SCHEMA_FILE = "test/valvemaster_test_schema.json";
+
+/**
+ * @brief Ordered schema keys loaded from the JSON schema file.
  *
- *   Nodes 1..6
- *   Valves 1..2 per node
+ * deviceSchemaMap_t is ordered by key, which is not the order we want for the
+ * field test. This vector preserves the JSON file order for command cycling.
+ */
+static vector<string> gSchemaKeys;
+
+/**
+ * @brief Read a JSON file from disk.
  *
- * This gives twelve schema-backed outputs and verifies that the driver does
- * not assume one node, one valve, or a hardcoded schema layout.
+ * @param path JSON file path.
+ * @return Parsed JSON object.
+ */
+static nlohmann::json read_json_file_or_die(const string& path)
+{
+    ifstream input(path);
+
+    if(!input.is_open()) {
+        die("cannot open schema file: " + path);
+    }
+
+    nlohmann::json j;
+
+    try {
+        input >> j;
+    }
+    catch(const std::exception& e) {
+        die("cannot parse schema file " + path + ": " + e.what());
+    }
+
+    return j;
+}
+
+/**
+ * @brief Extract a required string from a JSON object.
+ */
+static string json_required_string_or_die(const nlohmann::json& j,
+                                          const string& key,
+                                          const string& context)
+{
+    if(!j.contains(key) || !j[key].is_string()) {
+        die(context + " missing string field '" + key + "'");
+    }
+
+    return j[key].get<string>();
+}
+
+/**
+ * @brief Extract a required unsigned byte from a JSON object.
+ */
+static unsigned int json_required_u8_or_die(const nlohmann::json& j,
+                                            const string& key,
+                                            const string& context)
+{
+    if(!j.contains(key) || !j[key].is_number_unsigned()) {
+        die(context + " missing unsigned numeric field '" + key + "'");
+    }
+
+    unsigned int value = j[key].get<unsigned int>();
+
+    if(value > 255u) {
+        die(context + " field '" + key + "' exceeds 255");
+    }
+
+    return value;
+}
+
+/**
+ * @brief Build a VALVEMASTER schema for harness testing from JSON.
+ *
+ * The JSON file supplies only the test mapping data: key, title, node, and
+ * valve. The harness still sets the actual pIoTServer schema constants here,
+ * using the real names from pIoTServerSchema.hpp: BOOL and TR_IGNORE.
+ *
+ * This avoids inventing enum/type names that do not exist in the codebase.
  */
 static deviceSchemaMap_t make_valvemaster_schema()
 {
+    const string schemaPath = DEFAULT_SCHEMA_FILE;
+    nlohmann::json root = read_json_file_or_die(schemaPath);
+
+    if(!root.contains("values") || !root["values"].is_array()) {
+        die(schemaPath + " missing array field 'values'");
+    }
+
     deviceSchemaMap_t schema;
+    gSchemaKeys.clear();
 
-    deviceSchema_t sprk1;
-    sprk1.title = "A. Chard/Kale";
-    sprk1.units = BOOL;
-    sprk1.tracking = TR_IGNORE;
-    sprk1.readOnly = false;
-    sprk1.queryDelay = 5;
-    sprk1.otherProps = {
-        {"node", 1},
-        {"valve", 1}
-    };
-    schema["SPRK_1"] = sprk1;
+    for(size_t index = 0; index < root["values"].size(); index++) {
+        const nlohmann::json& item = root["values"][index];
+        const string context = schemaPath + " values[" + to_string(index) + "]";
 
-    deviceSchema_t sprk2;
-    sprk2.title = "B. Cucumbers";
-    sprk2.units = BOOL;
-    sprk2.tracking = TR_IGNORE;
-    sprk2.readOnly = false;
-    sprk2.queryDelay = 5;
-    sprk2.otherProps = {
-        {"node", 1},
-        {"valve", 2}
-    };
-    schema["SPRK_2"] = sprk2;
+        const string key = json_required_string_or_die(item, "key", context);
+        const string title = json_required_string_or_die(item, "title", context);
+        const unsigned int node = json_required_u8_or_die(item, "node", context);
+        const unsigned int valve = json_required_u8_or_die(item, "valve", context);
 
-    deviceSchema_t sprk3;
-    sprk3.title = "C. Tomatoes";
-    sprk3.units = BOOL;
-    sprk3.tracking = TR_IGNORE;
-    sprk3.readOnly = false;
-    sprk3.queryDelay = 5;
-    sprk3.otherProps = {
-        {"node", 2},
-        {"valve", 1}
-    };
-    schema["SPRK_3"] = sprk3;
+        if(schema.find(key) != schema.end()) {
+            die(context + " duplicate key '" + key + "'");
+        }
 
-    deviceSchema_t sprk4;
-    sprk4.title = "D. Peppers";
-    sprk4.units = BOOL;
-    sprk4.tracking = TR_IGNORE;
-    sprk4.readOnly = false;
-    sprk4.queryDelay = 5;
-    sprk4.otherProps = {
-        {"node", 2},
-        {"valve", 2}
-    };
-    schema["SPRK_4"] = sprk4;
+        deviceSchema_t entry;
+        entry.title = title;
+        entry.units = BOOL;
+        entry.tracking = TR_IGNORE;
+        entry.readOnly = false;
+        entry.queryDelay = 5;
+        entry.otherProps = {
+            {"node", node},
+            {"valve", valve}
+        };
 
-    deviceSchema_t sprk5;
-    sprk5.title = "E. Beans";
-    sprk5.units = BOOL;
-    sprk5.tracking = TR_IGNORE;
-    sprk5.readOnly = false;
-    sprk5.queryDelay = 5;
-    sprk5.otherProps = {
-        {"node", 3},
-        {"valve", 1}
-    };
-    schema["SPRK_5"] = sprk5;
+        schema[key] = entry;
+        gSchemaKeys.push_back(key);
+    }
 
-    deviceSchema_t sprk6;
-    sprk6.title = "F. Squash";
-    sprk6.units = BOOL;
-    sprk6.tracking = TR_IGNORE;
-    sprk6.readOnly = false;
-    sprk6.queryDelay = 5;
-    sprk6.otherProps = {
-        {"node", 3},
-        {"valve", 2}
-    };
-    schema["SPRK_6"] = sprk6;
+    if(schema.empty()) {
+        die(schemaPath + " contains no schema values");
+    }
 
-    deviceSchema_t sprk7;
-    sprk7.title = "G. Corn";
-    sprk7.units = BOOL;
-    sprk7.tracking = TR_IGNORE;
-    sprk7.readOnly = false;
-    sprk7.queryDelay = 5;
-    sprk7.otherProps = {
-        {"node", 4},
-        {"valve", 1}
-    };
-    schema["SPRK_7"] = sprk7;
-
-    deviceSchema_t sprk8;
-    sprk8.title = "H. Melons";
-    sprk8.units = BOOL;
-    sprk8.tracking = TR_IGNORE;
-    sprk8.readOnly = false;
-    sprk8.queryDelay = 5;
-    sprk8.otherProps = {
-        {"node", 4},
-        {"valve", 2}
-    };
-    schema["SPRK_8"] = sprk8;
-
-    deviceSchema_t sprk9;
-    sprk9.title = "I. Herbs";
-    sprk9.units = BOOL;
-    sprk9.tracking = TR_IGNORE;
-    sprk9.readOnly = false;
-    sprk9.queryDelay = 5;
-    sprk9.otherProps = {
-        {"node", 5},
-        {"valve", 1}
-    };
-    schema["SPRK_9"] = sprk9;
-
-    deviceSchema_t sprk10;
-    sprk10.title = "J. Lettuce";
-    sprk10.units = BOOL;
-    sprk10.tracking = TR_IGNORE;
-    sprk10.readOnly = false;
-    sprk10.queryDelay = 5;
-    sprk10.otherProps = {
-        {"node", 5},
-        {"valve", 2}
-    };
-    schema["SPRK_10"] = sprk10;
-
-    deviceSchema_t sprk11;
-    sprk11.title = "K. Carrots";
-    sprk11.units = BOOL;
-    sprk11.tracking = TR_IGNORE;
-    sprk11.readOnly = false;
-    sprk11.queryDelay = 5;
-    sprk11.otherProps = {
-        {"node", 6},
-        {"valve", 1}
-    };
-    schema["SPRK_11"] = sprk11;
-
-    deviceSchema_t sprk12;
-    sprk12.title = "L. Beets";
-    sprk12.units = BOOL;
-    sprk12.tracking = TR_IGNORE;
-    sprk12.readOnly = false;
-    sprk12.queryDelay = 5;
-    sprk12.otherProps = {
-        {"node", 6},
-        {"valve", 2}
-    };
-    schema["SPRK_12"] = sprk12;
-
+    note("Loaded schema file: " + schemaPath);
     return schema;
 }
 
 /**
  * @brief Return the ordered schema keys used by this harness.
  *
- * Keep this list in the same order as make_valvemaster_schema().
- *
- * The schema map itself is ordered by key name, but an explicit vector makes
- * the command test sequence obvious and prevents accidental ordering surprises
- * if names change later.
+ * The order comes from the JSON schema file, not from deviceSchemaMap_t.
  */
 static vector<string> make_ordered_schema_keys()
 {
-    return {
-        "SPRK_1",
-        "SPRK_2",
-        "SPRK_3",
-        "SPRK_4",
-        "SPRK_5",
-        "SPRK_6",
-        "SPRK_7",
-        "SPRK_8",
-        "SPRK_9",
-        "SPRK_10",
-        "SPRK_11",
-        "SPRK_12"
-    };
+    if(gSchemaKeys.empty()) {
+        die("schema key list is empty; make_valvemaster_schema() was not called");
+    }
+
+    return gSchemaKeys;
 }
 
 /**
@@ -515,6 +507,49 @@ static test_hook_fn_t load_test_hook(void* handle, const char* symbol)
     return hook;
 }
 
+/**
+ * @brief Load the VALVEMASTER wait-for-idle lab hook from the plugin.
+ */
+static wait_idle_hook_fn_t load_wait_idle_hook(void* handle, const char* symbol)
+{
+    dlerror();
+
+    auto hook = reinterpret_cast<wait_idle_hook_fn_t>(dlsym(handle, symbol));
+    const char* sym_error = dlerror();
+
+    if(sym_error) {
+        die(sym_error);
+    }
+
+    if(hook == nullptr) {
+        die(string("test hook not found: ") + symbol);
+    }
+
+    return hook;
+}
+
+/**
+ * @brief Wait for the driver's actionThread queue to drain.
+ */
+static void wait_for_driver_idle_or_die(pIoTServerDevice* dev,
+                                        wait_idle_hook_fn_t testWaitForIdle,
+                                        test_hook_fn_t testPowerOff,
+                                        void* handle,
+                                        const string& description,
+                                        uint32_t timeoutMs = ACTION_IDLE_TIMEOUT_MS)
+{
+    note(description);
+
+    if(testWaitForIdle(dev, timeoutMs)) {
+        return;
+    }
+
+    testPowerOff(dev);
+    delete dev;
+    dlclose(handle);
+    die("timed out waiting for VALVEMASTER actionThread idle: " + description);
+}
+
 /* ============================================================================
  * Device value helpers
  * ========================================================================== */
@@ -545,6 +580,20 @@ static void print_driver_version_or_die(pIoTServerDevice* dev,
     delete dev;
     dlclose(handle);
     die("getVersion() failed");
+}
+
+/**
+ * @brief Print the standalone test harness revision.
+ *
+ * This identifies the test harness itself, separate from:
+ *
+ *   - VALVEMASTER plugin/driver version
+ *   - Valve Master ATmega88PB firmware version
+ *   - ValveNode slave firmware versions
+ */
+static void print_harness_revision()
+{
+    note(string("Test harness revision: ") + HARNESS_REVISION);
 }
 
 /**
@@ -670,9 +719,11 @@ static void set_one_value_or_die(pIoTServerDevice* dev,
  *
  * This exercises the pIoTServerDevice::setValues() queue path for every schema
  * key. The command returns immediately after validation and queueing. The
- * actionThread later performs the real Valve Master I2C command.
+ * harness waits for actionThread idle after each request so the printed values
+ * and logs line up with completed hardware actions.
  */
 static void cycle_each_schema_valve_or_die(pIoTServerDevice* dev,
+                                           wait_idle_hook_fn_t testWaitForIdle,
                                            test_hook_fn_t testPowerOff,
                                            void* handle,
                                            const vector<string>& keys)
@@ -684,10 +735,18 @@ static void cycle_each_schema_valve_or_die(pIoTServerDevice* dev,
                              key,
                              "on",
                              "Turning " + key + " on.");
+
+        wait_for_driver_idle_or_die(dev,
+                                    testWaitForIdle,
+                                    testPowerOff,
+                                    handle,
+                                    "Waiting for " + key + " on action to complete.");
+
         print_values_or_die(dev,
                             testPowerOff,
                             handle,
                             "After " + key + " on:");
+
         wait_between_valve_actions();
 
         set_one_value_or_die(dev,
@@ -696,10 +755,18 @@ static void cycle_each_schema_valve_or_die(pIoTServerDevice* dev,
                              key,
                              "off",
                              "Turning " + key + " off.");
+
+        wait_for_driver_idle_or_die(dev,
+                                    testWaitForIdle,
+                                    testPowerOff,
+                                    handle,
+                                    "Waiting for " + key + " off action to complete.");
+
         print_values_or_die(dev,
                             testPowerOff,
                             handle,
                             "After " + key + " off:");
+
         wait_between_valve_actions();
     }
 }
@@ -708,10 +775,13 @@ static void cycle_each_schema_valve_or_die(pIoTServerDevice* dev,
  * @brief Turn every schema-backed valve on before the close-all test.
  *
  * This deliberately uses setValues() once per key so the log shows each schema
- * command clearly. After this, the harness calls allOff(), which must send one
- * hardware CMD_CLOSE_ALL broadcast rather than individually closing keys.
+ * command clearly. The harness waits for each queued hardware action to finish
+ * before sending the next one. After this, the harness calls allOff(), which
+ * must send one hardware CMD_CLOSE_ALL broadcast rather than individually
+ * closing keys.
  */
 static void turn_all_schema_valves_on_or_die(pIoTServerDevice* dev,
+                                             wait_idle_hook_fn_t testWaitForIdle,
                                              test_hook_fn_t testPowerOff,
                                              void* handle,
                                              const vector<string>& keys)
@@ -723,10 +793,18 @@ static void turn_all_schema_valves_on_or_die(pIoTServerDevice* dev,
                              key,
                              "on",
                              "Turning " + key + " on for all-off command test.");
+
+        wait_for_driver_idle_or_die(dev,
+                                    testWaitForIdle,
+                                    testPowerOff,
+                                    handle,
+                                    "Waiting for " + key + " all-off setup action to complete.");
+
         print_values_or_die(dev,
                             testPowerOff,
                             handle,
                             "After " + key + " on for all-off test:");
+
         wait_between_valve_actions();
     }
 }
@@ -772,6 +850,8 @@ int main(int argc, char* argv[])
     parse_args(argc, argv, pluginPath);
     setup_logging();
 
+    print_harness_revision();
+
     const char* plugin_path = pluginPath.c_str();
 
     /* ------------------------------------------------------------------------
@@ -804,8 +884,19 @@ int main(int argc, char* argv[])
     auto testPowerOn = load_test_hook(handle, "VALVEMASTER_testPowerOn");
     auto testPowerOff = load_test_hook(handle, "VALVEMASTER_testPowerOff");
     auto testProbeBus = load_test_hook(handle, "VALVEMASTER_testProbeBus");
-    auto testPingDiscoveredNodes = load_test_hook(handle, "VALVEMASTER_testPingDiscoveredNodes");
+
     auto testVersionScanDiscoveredNodes = load_test_hook(handle, "VALVEMASTER_testVersionScanDiscoveredNodes");
+    auto testWaitForIdle = load_wait_idle_hook(handle, "VALVEMASTER_testWaitForIdle");
+
+    /*
+     * Keep this hook loaded even though the normal harness path does not currently
+     * use it. Ping may become useful later as a lighter diagnostic than WHO or
+     * version scan, especially for targeted node-presence checks.
+     */
+    auto testPingDiscoveredNodes =
+        load_test_hook(handle, "VALVEMASTER_testPingDiscoveredNodes");
+    (void)testPingDiscoveredNodes;
+
 
     note("OK: VALVEMASTER test hooks found");
 
@@ -864,6 +955,12 @@ int main(int argc, char* argv[])
         die("VALVEMASTER_testPowerOn() failed");
     }
 
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for startup power-on action to complete.");
+
     note("Waiting for slave AVR nodes to wake.");
     this_thread::sleep_for(chrono::milliseconds(SLAVE_WAKE_SETTLE_MS));
 
@@ -878,15 +975,22 @@ int main(int argc, char* argv[])
      * --------------------------------------------------------------------- */
 
     all_off_or_die(dev, testPowerOff, handle);
+
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for startup hardware allOff to complete.");
+
     print_values_or_die(dev, testPowerOff, handle, "After startup hardware allOff:");
     wait_after_startup_alloff();
 
     /* ------------------------------------------------------------------------
      * RS-485 discovery and diagnostics
      *
-     * These test hooks are now async queue submissions. The harness no longer
-     * treats them as proof that the operation has completed before the next
-     * line runs.
+     * These test hooks are async queue submissions. The harness must wait for
+     * actionThread to become idle before treating discovery/version scan as
+     * complete.
      * --------------------------------------------------------------------- */
 
     note("Probing RS-485 valve-node bus.");
@@ -897,13 +1001,12 @@ int main(int argc, char* argv[])
         die("VALVEMASTER_testProbeBus() failed");
     }
 
-    note("Pinging discovered valve nodes.");
-    if(!testPingDiscoveredNodes(dev)) {
-        testPowerOff(dev);
-        delete dev;
-        dlclose(handle);
-        die("VALVEMASTER_testPingDiscoveredNodes() failed");
-    }
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for WHO discovery to complete.",
+                                ACTION_DISCOVERY_IDLE_TIMEOUT_MS);
 
     note("Version scanning discovered valve nodes.");
     if(!testVersionScanDiscoveredNodes(dev)) {
@@ -912,6 +1015,13 @@ int main(int argc, char* argv[])
         dlclose(handle);
         die("VALVEMASTER_testVersionScanDiscoveredNodes() failed");
     }
+
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for version scan to complete.",
+                                ACTION_DISCOVERY_IDLE_TIMEOUT_MS);
 
     print_values_or_die(dev, testPowerOff, handle, "Initial values:");
 
@@ -922,6 +1032,7 @@ int main(int argc, char* argv[])
      * --------------------------------------------------------------------- */
 
     cycle_each_schema_valve_or_die(dev,
+                                   testWaitForIdle,
                                    testPowerOff,
                                    handle,
                                    schemaKeys);
@@ -939,6 +1050,12 @@ int main(int argc, char* argv[])
      * diagnostic value.
      */
     wait_for_auto_power_off_check();
+
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for auto power-off settle to complete.");
 
     print_values_or_die(dev,
                         testPowerOff,
@@ -959,11 +1076,19 @@ int main(int argc, char* argv[])
      * --------------------------------------------------------------------- */
 
     turn_all_schema_valves_on_or_die(dev,
+                                     testWaitForIdle,
                                      testPowerOff,
                                      handle,
                                      schemaKeys);
 
     all_off_or_die(dev, testPowerOff, handle);
+
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for hardware allOff to complete.");
+
     print_values_or_die(dev, testPowerOff, handle, "After hardware allOff:");
     wait_between_valve_actions();
 
@@ -978,6 +1103,12 @@ int main(int argc, char* argv[])
         die("VALVEMASTER_testPowerOff() failed");
     }
 
+    wait_for_driver_idle_or_die(dev,
+                                testWaitForIdle,
+                                testPowerOff,
+                                handle,
+                                "Waiting for final power-off action to complete.");
+
     note("Stopping device.");
     dev->stop();
 
@@ -985,10 +1116,10 @@ int main(int argc, char* argv[])
     dlclose(handle);
 
     if(gPrint_flag) {
-        LOGT_INFO("PASS");
+        LOGT_INFO("PASS harness revision %s", HARNESS_REVISION);
     }
     else {
-        printf("PASS\n");
+        printf("PASS harness revision %s\n", HARNESS_REVISION);
     }
 
     return 0;

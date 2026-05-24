@@ -12,6 +12,7 @@
  * Valve Master specific diagnostics.
  */
 
+#include <cstdint>
 #include <string>
 
 #include "VALVEMASTER_Device.hpp"
@@ -136,4 +137,23 @@ extern "C" bool VALVEMASTER_testVersionScanDiscoveredNodes(pIoTServerDevice* dev
     }
 
     return valveMaster->testVersionScanDiscoveredNodes();
+}
+
+
+/**
+ * @brief Wait until queued VALVEMASTER lab/test work is complete.
+ *
+ * @param device Plugin instance returned by factory().
+ * @param timeoutMs Maximum wait in milliseconds.
+ * @return true if the device became idle before timeout.
+ */
+extern "C" bool VALVEMASTER_testWaitForIdle(pIoTServerDevice* device, uint32_t timeoutMs)
+{
+    VALVEMASTER_Device* valveMaster = asValveMaster(device);
+
+    if(valveMaster == nullptr) {
+        return false;
+    }
+
+    return valveMaster->testWaitForIdle(timeoutMs);
 }
