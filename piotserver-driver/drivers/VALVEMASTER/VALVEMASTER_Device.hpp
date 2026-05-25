@@ -134,7 +134,6 @@ private:
     bool executeSetValuesAction(const action_request_t& request);
     void armPowerHoldTimer();
     void cancelPowerHoldTimer();
-    bool powerHoldExpired();
     bool delayWithStopCheck(uint32_t delayMs, const char* reason);
     bool waitForIdle(uint32_t timeoutMs);
     void setLastActionStatus(const string& actionName, bool didSucceed);

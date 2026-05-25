@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 using namespace std;
 
@@ -26,21 +29,21 @@ using namespace std;
  * node command protocol.
  */
 
-static constexpr uint8_t REG_COMMAND      = 0x00;
-static constexpr uint8_t REG_STATUS       = 0x01;
-static constexpr uint8_t REG_ARG0         = 0x02;
-static constexpr uint8_t REG_ARG1         = 0x03;
-static constexpr uint8_t REG_ARG2         = 0x04;
-static constexpr uint8_t REG_RESULT       = 0x05;
-static constexpr uint8_t REG_POWER_STATE  = 0x06;
-static constexpr uint8_t REG_NODE_COUNT   = 0x07;
-static constexpr uint8_t REG_REPLY_NODE   = 0x08;
-static constexpr uint8_t REG_REPLY_CMD    = 0x09;
-static constexpr uint8_t REG_REPLY_ARG0   = 0x0A;
-static constexpr uint8_t REG_REPLY_ARG1   = 0x0B;
-static constexpr uint8_t REG_VERSION_HI   = 0x10;
-static constexpr uint8_t REG_VERSION_LO   = 0x11;
-static constexpr uint8_t REG_NODE_MAP     = 0x20;
+static constexpr uint8_t REG_COMMAND       = 0x00;
+static constexpr uint8_t REG_STATUS        = 0x01;
+static constexpr uint8_t REG_ARG0          = 0x02;
+static constexpr uint8_t REG_ARG1          = 0x03;
+static constexpr uint8_t REG_ARG2          = 0x04;
+static constexpr uint8_t REG_RESULT        = 0x05;
+static constexpr uint8_t REG_POWER_STATE   = 0x06;
+static constexpr uint8_t REG_NODE_COUNT    = 0x07;
+static constexpr uint8_t REG_REPLY_NODE    = 0x08;
+static constexpr uint8_t REG_REPLY_CMD     = 0x09;
+static constexpr uint8_t REG_REPLY_ARG0    = 0x0A;
+static constexpr uint8_t REG_REPLY_ARG1    = 0x0B;
+static constexpr uint8_t REG_VERSION_HI    = 0x10;
+static constexpr uint8_t REG_VERSION_LO    = 0x11;
+static constexpr uint8_t REG_NODE_MAP      = 0x20;
 
 
 // MARK: - Valve Master Command Values
@@ -55,14 +58,14 @@ static constexpr uint8_t REG_NODE_MAP     = 0x20;
  * The host then polls STATUS_BUSY and checks REG_RESULT.
  */
 
-static constexpr uint8_t CMD_POWER_ON          = 0x01;
-static constexpr uint8_t CMD_POWER_OFF         = 0x02;
-static constexpr uint8_t CMD_WHO               = 0x03;
-static constexpr uint8_t CMD_PING              = 0x04;
-static constexpr uint8_t CMD_SET_CHANNEL       = 0x05;
+static constexpr uint8_t CMD_POWER_ON           = 0x01;
+static constexpr uint8_t CMD_POWER_OFF          = 0x02;
+static constexpr uint8_t CMD_WHO                = 0x03;
+static constexpr uint8_t CMD_PING               = 0x04;
+static constexpr uint8_t CMD_SET_CHANNEL        = 0x05;
 static constexpr uint8_t CMD_GET_CHANNEL_STATUS = 0x06;
-static constexpr uint8_t CMD_GET_NODE_VERSION  = 0x07;
-static constexpr uint8_t CMD_CLOSE_ALL         = 0x0F;
+static constexpr uint8_t CMD_GET_NODE_VERSION   = 0x07;
+static constexpr uint8_t CMD_CLOSE_ALL          = 0x0F;
 
 
 // MARK: - Valve Master Status and Result Values
@@ -79,11 +82,11 @@ static constexpr uint8_t CMD_CLOSE_ALL         = 0x0F;
  * field-bus power.
  */
 
-static constexpr uint8_t STATUS_BUSY          = (1u << 0);
-static constexpr uint8_t STATUS_ERROR         = (1u << 1);
-static constexpr uint8_t STATUS_POWER_ON      = (1u << 2);
+static constexpr uint8_t STATUS_BUSY     = (1u << 0);
+static constexpr uint8_t STATUS_ERROR    = (1u << 1);
+static constexpr uint8_t STATUS_POWER_ON = (1u << 2);
 
-static constexpr uint8_t RESULT_OK            = 0x00;
+static constexpr uint8_t RESULT_OK       = 0x00;
 
 
 // MARK: - Node Map and Timing Constants
@@ -587,6 +590,23 @@ bool VALVEMASTER_Device::loadBindingsFromSchema()
     return true;
 }
 
+/**
+ * @brief Parse and cache Valve Master configuration properties.
+ *
+ * This reads the device properties supplied by the server or test harness and
+ * extracts:
+ *
+ *   - JSON_ARG_ADDRESS
+ *   - JSON_ARG_POWER_HOLD_SEC
+ *
+ * The parsed values are stored in _i2cAddress and _powerHoldSec under _mutex.
+ *
+ * This function intentionally does not call updateDiagnosticStateLocked().
+ * Parsing configuration is not a field-state change and should not mark cached
+ * device values as changed before the driver is actually started.
+ *
+ * @return true if the address and power-hold settings were valid.
+ */
 bool VALVEMASTER_Device::parseI2CAddress()
 {
     string addressText = "0x09";
@@ -613,11 +633,14 @@ bool VALVEMASTER_Device::parseI2CAddress()
         }
     }
 
-    _i2cAddress = parsed;
-    _powerHoldSec = powerHoldSec;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _i2cAddress = parsed;
+        _powerHoldSec = powerHoldSec;
+    }
 
-    LOGT_DEBUG("VALVEMASTER: configured I2C address 0x%02x", _i2cAddress);
-    LOGT_DEBUG("VALVEMASTER: configured power_hold_sec %lu", _powerHoldSec);
+    LOGT_DEBUG("VALVEMASTER: configured I2C address 0x%02x", parsed);
+    LOGT_DEBUG("VALVEMASTER: configured power_hold_sec %lu", powerHoldSec);
 
     return true;
 }
@@ -625,6 +648,22 @@ bool VALVEMASTER_Device::parseI2CAddress()
 
 // MARK: - Action Thread Helpers
 
+/**
+ * @brief Queue an action for the worker thread.
+ *
+ * All hardware operations are serialized through actionThread(). Public methods
+ * should validate input, build an action_request_t, and call queueAction()
+ * rather than performing I2C or RS-485 work directly.
+ *
+ * If clearPendingSetValues is true, queued ACTION_SET_VALUES requests are
+ * removed before the new request is appended. This is used by commands such as
+ * allOff() and testPowerOff(), where stale pending valve changes must not run
+ * after a shutdown or close-all command.
+ *
+ * @param request Action request to append.
+ * @param clearPendingSetValues Remove pending valve-set requests first.
+ * @return true if the action was accepted.
+ */
 bool VALVEMASTER_Device::queueAction(const action_request_t& request, bool clearPendingSetValues)
 {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -662,6 +701,7 @@ void VALVEMASTER_Device::armPowerHoldTimer()
     if(_powerHoldSec == 0) {
         _powerHoldActive = false;
         updateDiagnosticStateLocked();
+        _actionCv.notify_all();
         return;
     }
 
@@ -680,13 +720,7 @@ void VALVEMASTER_Device::cancelPowerHoldTimer()
 
     _powerHoldActive = false;
     updateDiagnosticStateLocked();
-}
-
-bool VALVEMASTER_Device::powerHoldExpired()
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-
-    return _powerHoldActive && chrono::steady_clock::now() >= _powerHoldDeadline;
+    _actionCv.notify_all();
 }
 
 bool VALVEMASTER_Device::delayWithStopCheck(uint32_t delayMs, const char* reason)
@@ -849,7 +883,14 @@ void VALVEMASTER_Device::actionThread()
 
     cancelPowerHoldTimer();
 
-    if(_fieldPowerOn) {
+    bool shouldPowerOff = false;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        shouldPowerOff = _fieldPowerOn;
+    }
+
+    if(shouldPowerOff) {
         LOGT_DEBUG("VALVEMASTER: actionThread shutdown powering field bus off");
 
         if(powerOff()) {
@@ -889,6 +930,23 @@ bool VALVEMASTER_Device::executeAction(const action_request_t& request)
 
     case ACTION_CLOSE_ALL:
         didSucceed = closeAllValves();
+
+        if(didSucceed) {
+            /*
+             * CLOSE_ALL is a hardware command. Do not mark cached valve states
+             * off until the Valve Master firmware reports command success.
+             */
+            std::lock_guard<std::mutex> lock(_mutex);
+
+            for(auto& [key, value] : _state) {
+                if(_bindings.find(key) != _bindings.end()) {
+                    value = "off";
+                }
+            }
+
+            updateDiagnosticStateLocked();
+        }
+
         cancelPowerHoldTimer();
 
         if(powerOff()) {
@@ -962,6 +1020,24 @@ bool VALVEMASTER_Device::executeAction(const action_request_t& request)
     return didSucceed;
 }
 
+/**
+ * @brief Execute queued valve state changes on the action thread.
+ *
+ * This runs in actionThread() context and performs the actual hardware work for
+ * ACTION_SET_VALUES.
+ *
+ * Each requested schema key is translated to its node/channel binding, then
+ * setValveChannel() is called. setValveChannel() sends CMD_SET_CHANNEL and
+ * immediately verifies the result using CMD_GET_CHANNEL_STATUS.
+ *
+ * Cached _state is updated only after successful command completion and status
+ * verification. If any valve operation fails, execution stops and returns
+ * false. The caller is responsible for canceling the power-hold timer and
+ * powering the field bus down on failure.
+ *
+ * @param request Queued ACTION_SET_VALUES request.
+ * @return true if every requested valve state was applied and verified.
+ */
 bool VALVEMASTER_Device::executeSetValuesAction(const action_request_t& request)
 {
     for(const auto& [key, requestedState] : request.values) {
@@ -981,6 +1057,13 @@ bool VALVEMASTER_Device::executeSetValuesAction(const action_request_t& request)
         if(!setValveChannel(binding.node, binding.valve, requestedState)) {
             LOGT_ERROR("VALVEMASTER: actionThread set failed for key '%s'", key.c_str());
             return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+
+            _state[key] = requestedState ? "on" : "off";
+            updateDiagnosticStateLocked();
         }
     }
 
@@ -1025,43 +1108,57 @@ bool VALVEMASTER_Device::writeCommand(uint8_t command)
 
 bool VALVEMASTER_Device::readMasterSummary()
 {
-    if(!readRegister(REG_VERSION_HI, _versionHi)) {
+    uint8_t versionHi = 0;
+    uint8_t versionLo = 0;
+    uint8_t status = 0;
+    uint8_t result = 0;
+    uint8_t powerState = 0;
+    uint8_t nodeCount = 0;
+
+    if(!readRegister(REG_VERSION_HI, versionHi)) {
         return false;
     }
 
-    if(!readRegister(REG_VERSION_LO, _versionLo)) {
+    if(!readRegister(REG_VERSION_LO, versionLo)) {
         return false;
     }
 
-    if(!readRegister(REG_STATUS, _lastStatus)) {
+    if(!readRegister(REG_STATUS, status)) {
         return false;
     }
 
-    if(!readRegister(REG_RESULT, _lastResult)) {
+    if(!readRegister(REG_RESULT, result)) {
         return false;
     }
 
-    if(!readRegister(REG_POWER_STATE, _lastPowerState)) {
+    if(!readRegister(REG_POWER_STATE, powerState)) {
         return false;
     }
 
-    if(!readRegister(REG_NODE_COUNT, _lastNodeCount)) {
+    if(!readRegister(REG_NODE_COUNT, nodeCount)) {
         return false;
     }
-
-    _fieldPowerOn = (_lastPowerState != 0);
 
     {
         std::lock_guard<std::mutex> lock(_mutex);
+
+        _versionHi = versionHi;
+        _versionLo = versionLo;
+        _lastStatus = status;
+        _lastResult = result;
+        _lastPowerState = powerState;
+        _lastNodeCount = nodeCount;
+        _fieldPowerOn = (_lastPowerState != 0);
+
         updateDiagnosticStateLocked();
     }
 
-    LOGT_DEBUG("VALVEMASTER: firmware version %u.%u", _versionHi, _versionLo);
+    LOGT_DEBUG("VALVEMASTER: firmware version %u.%u", versionHi, versionLo);
     LOGT_DEBUG("VALVEMASTER: status=0x%02x result=0x%02x power=%u nodes=%u",
-               _lastStatus,
-               _lastResult,
-               _lastPowerState,
-               _lastNodeCount);
+               status,
+               result,
+               powerState,
+               nodeCount);
 
     return true;
 }
@@ -1077,7 +1174,11 @@ bool VALVEMASTER_Device::waitNotBusy(uint32_t timeoutMs)
             return false;
         }
 
-        _lastStatus = status;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _lastStatus = status;
+            updateDiagnosticStateLocked();
+        }
 
         if((status & STATUS_BUSY) == 0) {
             return true;
@@ -1098,7 +1199,11 @@ bool VALVEMASTER_Device::checkResultOk(const char* operation)
         return false;
     }
 
-    _lastResult = result;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _lastResult = result;
+        updateDiagnosticStateLocked();
+    }
 
     if(result != RESULT_OK) {
         LOGT_ERROR("VALVEMASTER: %s failed result 0x%02x %s",
@@ -1114,22 +1219,37 @@ bool VALVEMASTER_Device::checkResultOk(const char* operation)
 
 // MARK: - Field-Bus Power Control
 
+/**
+ * @brief Turn on switched 12 V field-bus power through the Valve Master.
+ *
+ * This function is normally called from actionThread(), not directly from
+ * server-facing public methods. It validates that the driver is connected and
+ * running, then sends CMD_POWER_ON to the Valve Master firmware.
+ *
+ * The cached _fieldPowerOn value is updated only after the firmware reports
+ * success and REG_POWER_STATE is read back.
+ *
+ * The function does not pre-check _i2c.isAvailable() outside _mutex. Driver
+ * lifecycle state is protected by _mutex, and the actual I2C transaction is the
+ * authoritative test of bus availability.
+ *
+ * @return true if the Valve Master reports field power on.
+ */
 bool VALVEMASTER_Device::powerOn()
 {
-    if(!_isConnected || !_i2c.isAvailable()) {
-        LOGT_ERROR("VALVEMASTER: powerOn rejected, device is not connected");
-        return false;
-    }
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
 
-    if(_fieldPowerOn) {
-        LOGT_DEBUG("VALVEMASTER: field power already on");
-
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            updateDiagnosticStateLocked();
+        if(!_isConnected || !_running || _stopRequested) {
+            LOGT_ERROR("VALVEMASTER: powerOn rejected, device is not connected/running");
+            return false;
         }
 
-        return true;
+        if(_fieldPowerOn) {
+            LOGT_DEBUG("VALVEMASTER: field power already on");
+            updateDiagnosticStateLocked();
+            return true;
+        }
     }
 
     LOGT_DEBUG("VALVEMASTER: power on command");
@@ -1146,38 +1266,54 @@ bool VALVEMASTER_Device::powerOn()
         return false;
     }
 
-    if(!readRegister(REG_POWER_STATE, _lastPowerState)) {
+    uint8_t powerState = 0;
+
+    if(!readRegister(REG_POWER_STATE, powerState)) {
         return false;
     }
 
-    _fieldPowerOn = (_lastPowerState != 0);
+    bool fieldPowerOn = (powerState != 0);
 
     {
         std::lock_guard<std::mutex> lock(_mutex);
+
+        _lastPowerState = powerState;
+        _fieldPowerOn = fieldPowerOn;
+
         updateDiagnosticStateLocked();
     }
 
-    LOGT_DEBUG("VALVEMASTER: field power %s", _fieldPowerOn ? "on" : "off");
+    LOGT_DEBUG("VALVEMASTER: field power %s", fieldPowerOn ? "on" : "off");
 
-    return _fieldPowerOn;
+    return fieldPowerOn;
 }
 
+/**
+ * @brief Turn off switched 12 V field-bus power through the Valve Master.
+ *
+ * This function sends CMD_POWER_OFF to the Valve Master firmware and updates
+ * cached power state only after REG_POWER_STATE confirms the result.
+ *
+ * If cached state already says field power is off, the function returns true
+ * without sending a redundant command.
+ *
+ * @return true if field power is confirmed off.
+ */
 bool VALVEMASTER_Device::powerOff()
 {
-    if(!_isConnected || !_i2c.isAvailable()) {
-        LOGT_ERROR("VALVEMASTER: powerOff rejected, device is not connected");
-        return false;
-    }
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
 
-    if(!_fieldPowerOn) {
-        LOGT_DEBUG("VALVEMASTER: field power already off");
-
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            updateDiagnosticStateLocked();
+        if(!_isConnected || !_running || _stopRequested) {
+            LOGT_ERROR("VALVEMASTER: powerOff rejected, device is not connected/running");
+            return false;
         }
 
-        return true;
+        if(!_fieldPowerOn) {
+            LOGT_DEBUG("VALVEMASTER: field power already off");
+            updateDiagnosticStateLocked();
+            return true;
+        }
     }
 
     LOGT_DEBUG("VALVEMASTER: power off command");
@@ -1194,34 +1330,52 @@ bool VALVEMASTER_Device::powerOff()
         return false;
     }
 
-    if(!readRegister(REG_POWER_STATE, _lastPowerState)) {
+    uint8_t powerState = 0;
+
+    if(!readRegister(REG_POWER_STATE, powerState)) {
         return false;
     }
 
-    _fieldPowerOn = (_lastPowerState != 0);
+    bool fieldPowerOn = (powerState != 0);
 
     {
         std::lock_guard<std::mutex> lock(_mutex);
+
+        _lastPowerState = powerState;
+        _fieldPowerOn = fieldPowerOn;
+
         updateDiagnosticStateLocked();
     }
 
-    LOGT_DEBUG("VALVEMASTER: field power %s", _fieldPowerOn ? "on" : "off");
+    LOGT_DEBUG("VALVEMASTER: field power %s", fieldPowerOn ? "on" : "off");
 
-    return !_fieldPowerOn;
+    return !fieldPowerOn;
 }
 
 bool VALVEMASTER_Device::ensureFieldPowerOn(bool& didPowerOnOut)
 {
     didPowerOnOut = false;
 
-    bool wasOn = _fieldPowerOn;
+    bool wasOn = false;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        wasOn = _fieldPowerOn;
+    }
 
     if(!powerOn()) {
         return false;
     }
 
-    didPowerOnOut = !wasOn && _fieldPowerOn;
-    return true;
+    bool isOn = false;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        isOn = _fieldPowerOn;
+    }
+
+    didPowerOnOut = !wasOn && isOn;
+    return isOn;
 }
 
 bool VALVEMASTER_Device::settleAfterFieldPowerOnIfNeeded(bool didPowerOn, const char* reason)
@@ -1542,6 +1696,15 @@ bool VALVEMASTER_Device::versionScanDiscoveredNodes()
 
 bool VALVEMASTER_Device::start()
 {
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        if(_running || _thread.joinable()) {
+            LOGT_ERROR("VALVEMASTER: start rejected, device is already running");
+            return false;
+        }
+    }
+
     if(_schema.empty()) {
         _deviceState = DEVICE_STATE_ERROR;
         LOGT_ERROR("VALVEMASTER: start failed, schema is empty");
@@ -1559,41 +1722,66 @@ bool VALVEMASTER_Device::start()
         return false;
     }
 
+    uint8_t i2cAddress = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        i2cAddress = _i2cAddress;
+    }
+
     int error = 0;
 
-    LOGT_DEBUG("VALVEMASTER: opening I2C address 0x%02x", _i2cAddress);
+    LOGT_DEBUG("VALVEMASTER: opening I2C address 0x%02x", i2cAddress);
 
-    if(!_i2c.begin(_i2cAddress, error)) {
+    if(!_i2c.begin(i2cAddress, error)) {
         LOGT_ERROR("VALVEMASTER: I2C begin failed for address 0x%02x error=%d",
-                   _i2cAddress,
+                   i2cAddress,
                    error);
 
-        _isConnected = false;
-        _fieldPowerOn = false;
-        _deviceState = DEVICE_STATE_DISCONNECTED;
-        _dataDidChange = true;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _isConnected = false;
+            _fieldPowerOn = false;
+            _deviceState = DEVICE_STATE_DISCONNECTED;
+            updateDiagnosticStateLocked();
+        }
+
         return false;
     }
 
     if(!_i2c.smbQuick()) {
-        LOGT_ERROR("VALVEMASTER: no I2C ACK at address 0x%02x", _i2cAddress);
+        LOGT_ERROR("VALVEMASTER: no I2C ACK at address 0x%02x", i2cAddress);
 
         _i2c.stop();
-        _isConnected = false;
-        _fieldPowerOn = false;
-        _deviceState = DEVICE_STATE_DISCONNECTED;
-        _dataDidChange = true;
+
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _isConnected = false;
+            _fieldPowerOn = false;
+            _deviceState = DEVICE_STATE_DISCONNECTED;
+            updateDiagnosticStateLocked();
+        }
+
         return false;
     }
 
-    _isConnected = true;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _isConnected = true;
+        updateDiagnosticStateLocked();
+    }
 
     if(!readMasterSummary()) {
         _i2c.stop();
-        _isConnected = false;
-        _fieldPowerOn = false;
-        _deviceState = DEVICE_STATE_DISCONNECTED;
-        _dataDidChange = true;
+
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _isConnected = false;
+            _fieldPowerOn = false;
+            _deviceState = DEVICE_STATE_DISCONNECTED;
+            updateDiagnosticStateLocked();
+        }
+
         return false;
     }
 
@@ -1605,13 +1793,25 @@ bool VALVEMASTER_Device::start()
         _actionBusy = false;
         _powerHoldActive = false;
         _actionQueue.clear();
+        _deviceState = DEVICE_STATE_CONNECTED;
         updateDiagnosticStateLocked();
     }
 
-    _thread = std::thread(&VALVEMASTER_Device::actionThread, this);
+    try {
+        _thread = std::thread(&VALVEMASTER_Device::actionThread, this);
+    }
+    catch(...) {
+        _i2c.stop();
 
-    _deviceState = DEVICE_STATE_CONNECTED;
-    _dataDidChange = true;
+        std::lock_guard<std::mutex> lock(_mutex);
+        _running = false;
+        _stopRequested = false;
+        _isConnected = false;
+        _fieldPowerOn = false;
+        _deviceState = DEVICE_STATE_DISCONNECTED;
+        updateDiagnosticStateLocked();
+        throw;
+    }
 
     LOGT_DEBUG("VALVEMASTER: device started");
 
@@ -1665,7 +1865,11 @@ bool VALVEMASTER_Device::isConnected()
 {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    return _deviceState == DEVICE_STATE_CONNECTED && _isConnected && _i2c.isAvailable();
+    return _isSetup &&
+           _running &&
+           !_stopRequested &&
+           _deviceState == DEVICE_STATE_CONNECTED &&
+           _isConnected;
 }
 
 bool VALVEMASTER_Device::setEnabled(bool enable)
@@ -1933,6 +2137,30 @@ bool VALVEMASTER_Device::closeAllValves()
     return checkResultOk("closeAll");
 }
 
+/**
+ * @brief Queue one or more valve state changes.
+ *
+ * This is the server-facing write path used by pIoTServerMgr::setValues().
+ * It validates schema keys, checks that each key maps to a writable valve
+ * binding, parses requested boolean states, and queues an ACTION_SET_VALUES
+ * request for actionThread().
+ *
+ * This function intentionally does not update _state for valve keys.
+ *
+ * Public setValues() means "request this change." It does not mean the remote
+ * ValveNode has actually moved. Cached valve state is updated later by
+ * executeSetValuesAction(), after:
+ *
+ *   - CMD_SET_CHANNEL succeeds
+ *   - CMD_GET_CHANNEL_STATUS succeeds
+ *   - the reported channel state matches the requested state
+ *
+ * This prevents the database from recording a valve as on/off when the RS-485
+ * command timed out or the node failed verification.
+ *
+ * @param kv Map of schema key to requested value string.
+ * @return true if the request was valid and queued, or if kv was empty.
+ */
 bool VALVEMASTER_Device::setValues(keyValueMap_t kv)
 {
     action_request_t request;
@@ -1952,7 +2180,9 @@ bool VALVEMASTER_Device::setValues(keyValueMap_t kv)
                 return false;
             }
 
-            if(_bindings.find(key) == _bindings.end()) {
+            auto bindingIt = _bindings.find(key);
+
+            if(bindingIt == _bindings.end()) {
                 LOGT_ERROR("VALVEMASTER: setValues rejected read-only or diagnostic key '%s'",
                            key.c_str());
                 return false;
@@ -1967,19 +2197,11 @@ bool VALVEMASTER_Device::setValues(keyValueMap_t kv)
                 return false;
             }
 
-            ValveBinding binding;
-
-            if(!getBindingForKey(key, binding)) {
-                LOGT_ERROR("VALVEMASTER: no binding for key '%s'", key.c_str());
-                return false;
-            }
+            const ValveBinding& binding = bindingIt->second;
 
             request.values.push_back(std::make_pair(key, parsed));
 
-            _state[key] = parsed ? "on" : "off";
-            _dataDidChange = true;
-
-            LOGT_DEBUG("VALVEMASTER: queued schema key '%s' node=%u valve=%u state=%s",
+            LOGT_DEBUG("VALVEMASTER: queued schema key '%s' node=%u valve=%u requested=%s",
                        key.c_str(),
                        binding.node,
                        binding.valve,
@@ -2018,6 +2240,19 @@ bool VALVEMASTER_Device::getValues(keyValueMap_t& results)
     return true;
 }
 
+/**
+ * @brief Queue a hardware close-all command.
+ *
+ * This queues ACTION_CLOSE_ALL and removes pending ACTION_SET_VALUES requests.
+ * It does not immediately update cached valve states.
+ *
+ * Cached valve states are marked off only after closeAllValves() succeeds in
+ * executeAction(). This keeps all valve state reporting consistent: public API
+ * methods queue work, while the action thread updates cached state after
+ * hardware success.
+ *
+ * @return true if the close-all action was queued.
+ */
 bool VALVEMASTER_Device::allOff()
 {
     action_request_t request;
@@ -2030,14 +2265,6 @@ bool VALVEMASTER_Device::allOff()
             LOGT_ERROR("VALVEMASTER: allOff rejected, device is not running/connected");
             return false;
         }
-
-        for(auto& [key, value] : _state) {
-            if(_bindings.find(key) != _bindings.end()) {
-                value = "off";
-            }
-        }
-
-        updateDiagnosticStateLocked();
     }
 
     return queueAction(request, true);
