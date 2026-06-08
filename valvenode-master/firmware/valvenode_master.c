@@ -67,7 +67,7 @@
 #define MASTER_VERSION_HI           0x01u
 
 /** @brief Master firmware version low byte. */
-#define MASTER_VERSION_LO           0x05u
+#define MASTER_VERSION_LO           0x06u
 
 /** @brief Highest valid assigned valve-node address. */
 #define MAX_NODE_ADDR               254u
@@ -178,6 +178,7 @@ static volatile uint8_t g_reg_ptr = 0u;
 static volatile bool g_have_reg_ptr = false;
 static volatile uint8_t g_pending_cmd = CMD_NONE;
 static volatile bool g_cmd_pending = false;
+static volatile bool g_i2c_reinit_pending = false;
 
 static char g_rx_line[RX_LINE_MAX];
 
@@ -1326,19 +1327,55 @@ static void execute_command(uint8_t cmd)
  * I2C slave
  * ========================================================================== */
 
+static inline uint8_t i2c_read_current_reg(void)
+{
+    if (g_reg_ptr == REG_VERSION_HI) {
+        return MASTER_VERSION_HI;
+    }
+
+    if (g_reg_ptr == REG_VERSION_LO) {
+        return MASTER_VERSION_LO;
+    }
+
+    return g_regs[g_reg_ptr];
+}
+
+
 static void i2c_init(void)
 {
+    g_i2c_reinit_pending = false;
+    g_reg_ptr = REG_STATUS;
+    g_have_reg_ptr = false;
+
+    TWCR = 0u;
     TWAR = (uint8_t)(I2C_ADDR << 1);
     TWAMR = 0x00u;
-    TWCR = (1u << TWEA) | (1u << TWEN) | (1u << TWIE);
+
+    /*
+     * Preload TWDR before enabling TWI.
+     *
+     * Use a known-safe register. Do not preload from whatever g_reg_ptr
+     * happened to contain before reinitialization.
+     */
+    TWDR = i2c_read_current_reg();
+
+    TWCR = (1u << TWINT) |
+           (1u << TWEA)  |
+           (1u << TWEN)  |
+           (1u << TWIE);
 }
+
 
 ISR(TWI_vect)
 {
-    switch (TW_STATUS) {
+    uint8_t status = TW_STATUS;
+
+    switch (status) {
 
     case TW_SR_SLA_ACK:
     case TW_SR_GCALL_ACK:
+    case TW_SR_ARB_LOST_SLA_ACK:
+    case TW_SR_ARB_LOST_GCALL_ACK:
         g_have_reg_ptr = false;
 
         TWCR = (1u << TWINT) |
@@ -1348,6 +1385,7 @@ ISR(TWI_vect)
         break;
 
     case TW_SR_DATA_ACK:
+    case TW_SR_DATA_NACK:
     {
         uint8_t data = TWDR;
 
@@ -1364,7 +1402,6 @@ ISR(TWI_vect)
                 } else {
                     g_regs[REG_RESULT] = RESULT_BUSY;
                     g_regs[REG_STATUS] |= STATUS_ERROR;
-                    update_fault_outputs();
                 }
             }
 
@@ -1388,31 +1425,14 @@ ISR(TWI_vect)
         break;
 
     case TW_ST_SLA_ACK:
-        if (g_reg_ptr == REG_VERSION_HI) {
-            TWDR = MASTER_VERSION_HI;
-        } else if (g_reg_ptr == REG_VERSION_LO) {
-            TWDR = MASTER_VERSION_LO;
-        } else {
-            TWDR = g_regs[g_reg_ptr];
-        }
-
-        g_reg_ptr++;
-
-        TWCR = (1u << TWINT) |
-               (1u << TWEA)  |
-               (1u << TWEN)  |
-               (1u << TWIE);
-        break;
-
+    case TW_ST_ARB_LOST_SLA_ACK:
     case TW_ST_DATA_ACK:
-        if (g_reg_ptr == REG_VERSION_HI) {
-            TWDR = MASTER_VERSION_HI;
-        } else if (g_reg_ptr == REG_VERSION_LO) {
-            TWDR = MASTER_VERSION_LO;
-        } else {
-            TWDR = g_regs[g_reg_ptr];
-        }
-
+        /*
+         * Keep transmit path short.
+         *
+         * Load the byte now, advance the register pointer, then clear TWINT.
+         */
+        TWDR = i2c_read_current_reg();
         g_reg_ptr++;
 
         TWCR = (1u << TWINT) |
@@ -1430,11 +1450,25 @@ ISR(TWI_vect)
         break;
 
     case TW_BUS_ERROR:
+        g_i2c_reinit_pending = true;
+        g_have_reg_ptr = false;
+        g_reg_ptr = REG_STATUS;
+
+        TWCR = (1u << TWINT) |
+                (1u << TWSTO) |
+                (1u << TWEN);
+        break;
+
     default:
-        TWCR = (1u << TWSTO) |
-               (1u << TWINT) |
-               (1u << TWEN)  |
+        /*
+         * Unknown/unhandled TWI state.
+         *
+         * Do not treat every unknown state as a hard bus error. Re-arm the
+         * slave and keep the transaction machinery short.
+         */
+        TWCR = (1u << TWINT) |
                (1u << TWEA)  |
+               (1u << TWEN)  |
                (1u << TWIE);
         break;
     }
@@ -1475,7 +1509,6 @@ int main(void)
     gpio_init();
     regs_init();
     uart_init();
-    i2c_init();
 
     /*
      * Safe idle outputs.
@@ -1493,9 +1526,21 @@ int main(void)
     g_regs[REG_RESULT] = RESULT_OK;
     update_fault_outputs();
 
+    /*
+     * Initialize I2C after the register file is in its final boot state,
+     * because i2c_init() preloads TWDR from g_regs.
+     */
+    i2c_init();
+
     sei();
 
     for (;;) {
+        if (g_i2c_reinit_pending) {
+            cli();
+            i2c_init();
+            sei();
+        }
+
         if (g_cmd_pending) {
             uint8_t cmd;
 
